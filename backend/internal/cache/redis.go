@@ -3,7 +3,9 @@ package cache
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -16,6 +18,28 @@ var ErrRedisURLRequired = errors.New("redis URL is required")
 // ErrRedisNotInitialized protects callers from trying to use a Redis client
 // that was never initialized successfully.
 var ErrRedisNotInitialized = errors.New("redis is not initialized")
+
+// ErrInvalidRateLimitCounter protects the Redis boundary from creating
+// permanent or ambiguously named security counters.
+var ErrInvalidRateLimitCounter = errors.New("invalid rate limit counter input")
+
+// incrementLoginAttemptCountersScript updates the email and network counters
+// in one Redis operation. The expiry is set only when a fixed window begins;
+// later attempts cannot extend the window indefinitely.
+var incrementLoginAttemptCountersScript = redis.NewScript(`
+local function increment_with_expiry(key, ttl_ms)
+  local count = redis.call("INCR", key)
+  if count == 1 or redis.call("PTTL", key) < 0 then
+    redis.call("PEXPIRE", key, ttl_ms)
+  end
+  return count
+end
+
+return {
+  increment_with_expiry(KEYS[1], ARGV[1]),
+  increment_with_expiry(KEYS[2], ARGV[1])
+}
+`)
 
 // Redis owns the Redis client used by the application.
 //
@@ -64,6 +88,49 @@ func (r *Redis) Ping(ctx context.Context) error {
 	}
 
 	return r.client.Ping(ctx).Err()
+}
+
+// IncrementLoginAttemptCounters atomically consumes one attempt from both
+// login-rate-limit dimensions. Keys must already be opaque identifiers; the
+// cache layer deliberately never receives the email address or IP address.
+func (r *Redis) IncrementLoginAttemptCounters(
+	ctx context.Context,
+	emailCounterKey string,
+	ipCounterKey string,
+	window time.Duration,
+) (emailAttempts int64, ipAttempts int64, err error) {
+	if r == nil || r.client == nil {
+		return 0, 0, ErrRedisNotInitialized
+	}
+
+	if strings.TrimSpace(emailCounterKey) == "" ||
+		strings.TrimSpace(ipCounterKey) == "" ||
+		emailCounterKey == ipCounterKey ||
+		window < time.Millisecond {
+		return 0, 0, ErrInvalidRateLimitCounter
+	}
+
+	result, err := incrementLoginAttemptCountersScript.Run(
+		ctx,
+		r.client,
+		[]string{emailCounterKey, ipCounterKey},
+		window.Milliseconds(),
+	).Slice()
+	if err != nil {
+		return 0, 0, err
+	}
+
+	if len(result) != 2 {
+		return 0, 0, fmt.Errorf("unexpected login rate limit counter response")
+	}
+
+	emailAttempts, emailOK := result[0].(int64)
+	ipAttempts, ipOK := result[1].(int64)
+	if !emailOK || !ipOK || emailAttempts < 1 || ipAttempts < 1 {
+		return 0, 0, fmt.Errorf("invalid login rate limit counter response")
+	}
+
+	return emailAttempts, ipAttempts, nil
 }
 
 // Close releases resources owned by the Redis client.

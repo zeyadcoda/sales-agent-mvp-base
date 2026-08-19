@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strings"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -67,6 +69,38 @@ func (db *Postgres) Ping(ctx context.Context) error {
 	}
 
 	return db.pool.Ping(ctx)
+}
+
+// Exec and QueryRow expose only the narrow pgx operations needed by
+// domain-owned PostgreSQL repositories. The connection pool itself remains
+// private so HTTP handlers and Agents cannot acquire unrestricted database
+// access.
+func (db *Postgres) Exec(
+	ctx context.Context,
+	query string,
+	args ...any,
+) (pgconn.CommandTag, error) {
+	if db == nil || db.pool == nil {
+		return pgconn.CommandTag{}, ErrDatabaseNotInitialized
+	}
+
+	return db.pool.Exec(ctx, query, args...)
+}
+
+func (db *Postgres) QueryRow(ctx context.Context, query string, args ...any) pgx.Row {
+	if db == nil || db.pool == nil {
+		return errorRow{err: ErrDatabaseNotInitialized}
+	}
+
+	return db.pool.QueryRow(ctx, query, args...)
+}
+
+type errorRow struct {
+	err error
+}
+
+func (row errorRow) Scan(_ ...any) error {
+	return row.err
 }
 
 // Close releases all database connections owned by this process.

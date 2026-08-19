@@ -3,10 +3,12 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"salesagent.local/backend/internal/runtimeenv"
 )
@@ -21,6 +23,10 @@ const (
 	AppLocal      AppEnvironment = "local"
 	AppTest       AppEnvironment = "test"
 	AppProduction AppEnvironment = "production"
+
+	defaultAuthSessionTTL = 8 * time.Hour
+	minimumAuthSessionTTL = 15 * time.Minute
+	maximumAuthSessionTTL = 24 * time.Hour
 )
 
 // Config contains validated server-side configuration.
@@ -33,6 +39,17 @@ type Config struct {
 
 	APIHost string
 	APIPort int
+	// AppOrigin is the exact browser origin allowed to make authenticated
+	// state-changing requests. It is server configuration, never client input.
+	AppOrigin string
+
+	// AuthOTPBypass is a temporary local-development control. Load rejects it
+	// outside APP_ENV=local so it cannot become a production auth path.
+	AuthOTPBypass  bool
+	AuthSessionTTL time.Duration
+	// AuthTrustedProxyCIDRs defines the only network peers whose forwarded
+	// client-address chain the authentication rate limiter may trust.
+	AuthTrustedProxyCIDRs []netip.Prefix
 
 	DatabaseURL string
 	RedisURL    string
@@ -63,6 +80,33 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
+	appOrigin, err := parseAppOrigin(os.Getenv("APP_ORIGIN"), appEnvironment)
+	if err != nil {
+		return Config{}, err
+	}
+
+	authOTPBypass, err := parseOptionalBool("AUTH_OTP_BYPASS", os.Getenv("AUTH_OTP_BYPASS"))
+	if err != nil {
+		return Config{}, err
+	}
+
+	// The development bypass is intentionally guarded by the deployment
+	// environment at startup. Frontend state and execution-plane selection
+	// cannot weaken this boundary.
+	if authOTPBypass && appEnvironment != AppLocal {
+		return Config{}, fmt.Errorf("AUTH_OTP_BYPASS may be enabled only when APP_ENV=local")
+	}
+
+	authSessionTTL, err := parseAuthSessionTTL(os.Getenv("AUTH_SESSION_TTL"))
+	if err != nil {
+		return Config{}, err
+	}
+
+	authTrustedProxyCIDRs, err := parseTrustedProxyCIDRs(os.Getenv("AUTH_TRUSTED_PROXY_CIDRS"))
+	if err != nil {
+		return Config{}, err
+	}
+
 	databaseURL, err := validateURL(
 		"DATABASE_URL",
 		os.Getenv("DATABASE_URL"),
@@ -84,18 +128,28 @@ func Load() (Config, error) {
 	}
 
 	return Config{
-		AppEnvironment:       appEnvironment,
-		ExecutionEnvironment: executionEnvironment,
-		APIHost:              apiHost,
-		APIPort:              apiPort,
-		DatabaseURL:          databaseURL,
-		RedisURL:             redisURL,
+		AppEnvironment:        appEnvironment,
+		ExecutionEnvironment:  executionEnvironment,
+		APIHost:               apiHost,
+		APIPort:               apiPort,
+		AppOrigin:             appOrigin,
+		AuthOTPBypass:         authOTPBypass,
+		AuthSessionTTL:        authSessionTTL,
+		AuthTrustedProxyCIDRs: authTrustedProxyCIDRs,
+		DatabaseURL:           databaseURL,
+		RedisURL:              redisURL,
 	}, nil
 }
 
 // APIAddress builds the HTTP listen address safely for IPv4, IPv6, or hostnames.
 func (c Config) APIAddress() string {
 	return net.JoinHostPort(c.APIHost, strconv.Itoa(c.APIPort))
+}
+
+// CookieSecure reports whether authentication cookies must be restricted to
+// HTTPS. Local HTTP is the sole exception needed for loopback development.
+func (c Config) CookieSecure() bool {
+	return c.AppEnvironment != AppLocal
 }
 
 // parseAppEnvironment accepts only known application environments.
@@ -123,6 +177,105 @@ func parsePort(value string) (int, error) {
 	}
 
 	return port, nil
+}
+
+// parseAppOrigin accepts one exact HTTP(S) origin rather than a URL prefix.
+// Credentials, paths, queries, and fragments would make Origin comparison
+// ambiguous and are rejected during startup.
+func parseAppOrigin(value string, appEnvironment AppEnvironment) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", fmt.Errorf("APP_ORIGIN is required")
+	}
+
+	parsed, err := url.Parse(value)
+	if err != nil || !parsed.IsAbs() || parsed.Host == "" || parsed.Hostname() == "" || parsed.Opaque != "" {
+		return "", fmt.Errorf("APP_ORIGIN must be an absolute HTTP or HTTPS origin")
+	}
+
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", fmt.Errorf("APP_ORIGIN must use HTTP or HTTPS")
+	}
+
+	if strings.HasSuffix(parsed.Host, ":") {
+		return "", fmt.Errorf("APP_ORIGIN has an invalid TCP port")
+	}
+	if port := parsed.Port(); port != "" {
+		portNumber, portErr := strconv.Atoi(port)
+		if portErr != nil || portNumber < 1 || portNumber > 65535 {
+			return "", fmt.Errorf("APP_ORIGIN has an invalid TCP port")
+		}
+	}
+
+	if parsed.User != nil || parsed.Path != "" || parsed.RawPath != "" || parsed.ForceQuery || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawFragment != "" {
+		return "", fmt.Errorf("APP_ORIGIN must not contain credentials, a path, query, or fragment")
+	}
+
+	if appEnvironment == AppProduction && parsed.Scheme != "https" {
+		return "", fmt.Errorf("APP_ORIGIN must use HTTPS when APP_ENV=production")
+	}
+
+	return value, nil
+}
+
+func parseOptionalBool(name string, value string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "false":
+		return false, nil
+	case "true":
+		return true, nil
+	default:
+		return false, fmt.Errorf("%s must be true or false", name)
+	}
+}
+
+func parseAuthSessionTTL(value string) (time.Duration, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return defaultAuthSessionTTL, nil
+	}
+
+	ttl, err := time.ParseDuration(value)
+	if err != nil || ttl < minimumAuthSessionTTL || ttl > maximumAuthSessionTTL {
+		return 0, fmt.Errorf(
+			"AUTH_SESSION_TTL must be a duration between %s and %s",
+			minimumAuthSessionTTL,
+			maximumAuthSessionTTL,
+		)
+	}
+
+	return ttl, nil
+}
+
+func parseTrustedProxyCIDRs(value string) ([]netip.Prefix, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, nil
+	}
+
+	parts := strings.Split(value, ",")
+	prefixes := make([]netip.Prefix, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		prefix, err := netip.ParsePrefix(part)
+		if err != nil || prefix.Bits() == 0 || prefix.Addr().Is4In6() {
+			// Reject an all-addresses range and IPv4-mapped IPv6 notation because
+			// either can make a trusted-proxy boundary broader than it appears.
+			return nil, fmt.Errorf("AUTH_TRUSTED_PROXY_CIDRS must contain valid, bounded IP CIDRs")
+		}
+
+		prefix = prefix.Masked()
+		key := prefix.String()
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+
+		seen[key] = struct{}{}
+		prefixes = append(prefixes, prefix)
+	}
+
+	return prefixes, nil
 }
 
 // validateURL validates infrastructure URLs without returning their raw value

@@ -39,3 +39,23 @@ func TestServeUntilShutdownWithCanceledContext(t *testing.T) {
 		t.Fatal("serveUntilShutdown() did not stop after context cancellation")
 	}
 }
+
+func TestAPIServerHasBoundedTransportSettings(t *testing.T) {
+	t.Parallel()
+
+	server := newAPIServer("127.0.0.1:8081", http.NotFoundHandler())
+	if server.ReadHeaderTimeout != apiReadHeaderTimeout ||
+		server.ReadTimeout != apiReadTimeout ||
+		server.WriteTimeout != apiWriteTimeout ||
+		server.IdleTimeout != apiIdleTimeout ||
+		server.MaxHeaderBytes != apiMaxHeaderBytes {
+		t.Fatalf(
+			"server transport bounds = headers %s read %s write %s idle %s bytes %d",
+			server.ReadHeaderTimeout,
+			server.ReadTimeout,
+			server.WriteTimeout,
+			server.IdleTimeout,
+			server.MaxHeaderBytes,
+		)
+	}
+}
