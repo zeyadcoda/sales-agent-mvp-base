@@ -10,6 +10,7 @@
 | Backend baseline | Go |
 | Agent runtime | Google ADK for Go v2 |
 | Initial implementation scope | Super Admin CP + internal platform/backend + Agent testing foundation |
+| Runtime dependency amendment | ADR-0002 — Required Redis Runtime (2026-08-19) |
 
 ---
 
@@ -114,6 +115,8 @@ Package snapshots, production Agent Versions, Agent Runs, pricing basis, Audit E
 
 Use PostgreSQL as the primary durable coordination and business datastore. Do not introduce Kafka, Kubernetes, service mesh, or large workflow infrastructure during MVP unless a demonstrated requirement cannot be met safely without it.
 
+Redis is a required, non-authoritative application-runtime dependency. It may support only explicitly designed ephemeral concerns; it does not replace PostgreSQL-backed durable state or operations.
+
 ---
 
 ## 3. Approved Implementation Scope
@@ -155,6 +158,7 @@ flowchart LR
     WEB --> API[Go Platform API]
 
     API --> PG[(PostgreSQL)]
+    API --> REDIS[(Redis Runtime)]
     API --> OBJ[(Object Storage)]
     API --> OPS[Background Operations / Outbox]
 
@@ -186,7 +190,7 @@ The primary trust boundaries are:
 1. Browser → API.
 2. Public applicant → public endpoints.
 3. Super Admin session → protected Control Plane APIs.
-4. API/Application → database.
+4. API/Application → PostgreSQL and Redis runtime infrastructure.
 5. Application → Agent runtime.
 6. Agent runtime → governed tools.
 7. Application → provider adapters.
@@ -226,6 +230,7 @@ Each boundary must have explicit authentication/authorization/input validation a
 ### 5.3 Database
 
 - PostgreSQL, supported stable major chosen during environment preparation.
+- PostgreSQL is the authoritative source of durable business and security state.
 - UUID/opaque identifiers for externally visible records; identifiers are not authorization.
 - JSONB only for genuinely flexible/versioned payloads, not as a substitute for core relational entities.
 
@@ -234,7 +239,9 @@ Each boundary must have explicit authentication/authorization/input validation a
 - S3-compatible object-storage abstraction.
 - MinIO locally if object-storage behavior is needed before a cloud provider is chosen.
 - Mailpit locally for notification/OTP email capture.
-- No Redis required at initial baseline. Add Redis only if measured requirements justify cache/rate-limit/distributed coordination that PostgreSQL cannot serve cleanly.
+- Redis is required for MVP application runtime and API readiness.
+- Redis is limited to short-lived, reconstructible concerns such as rate limiting, coordination, justified caching, and other explicitly designed ephemeral functions.
+- Redis must never be the authoritative or sole store for Organizations, Packages, Agents, Audit, authentication identities, or any other durable business record.
 
 ### 5.5 Dependency pinning
 
@@ -399,6 +406,7 @@ Domain code owns deterministic state transitions and invariants.
 Infrastructure owns:
 
 - PostgreSQL implementation;
+- Redis runtime adapter;
 - object storage;
 - email delivery;
 - provider HTTP clients;
@@ -691,7 +699,20 @@ Use HTTP status codes consistently:
 - `429` rate limited;
 - `503` dependency/readiness unavailable when applicable.
 
-### 12.5 Long-running work
+### 12.5 Process health endpoints
+
+- `GET /health/live` reports only whether the API process is alive. It does not query PostgreSQL or Redis.
+- `GET /health/ready` uses bounded checks and returns `200 {"status":"ready"}` only when both PostgreSQL and Redis are present and healthy.
+- A missing, failed, or timed-out PostgreSQL or Redis dependency returns `503 {"status":"not_ready"}` without exposing raw dependency errors.
+
+Redis failure must never cause:
+
+- fallback to unsafe or permissive state;
+- bypass of authentication, authorization, tenant isolation, rate limits, or other security controls;
+- loss of authoritative business records;
+- a false `READY` or `HEALTHY` signal.
+
+### 12.6 Long-running work
 
 Long Agent/provider operations return an operation resource, not an HTTP request held open indefinitely.
 
@@ -1778,6 +1799,8 @@ Backend configuration is loaded into a typed struct and validated at startup.
 
 Invalid required production configuration fails startup; do not continue with insecure defaults.
 
+`DATABASE_URL` and `REDIS_URL` are required server-side configuration. Missing or invalid values fail closed and must never be supplied by a browser, Agent, or other untrusted caller.
+
 ### 37.2 Environment classification
 
 Separate concepts:
@@ -1807,6 +1830,7 @@ Initial local services through Compose:
 
 ```text
 PostgreSQL
+Redis
 MinIO (when storage needed)
 Mailpit
 ```
@@ -1838,6 +1862,7 @@ Production Worker container
 TEST Worker container
 Scheduler container
 Managed PostgreSQL
+Managed Redis
 Managed Object Storage
 Managed Secret Store
 Telemetry backend
@@ -1845,7 +1870,7 @@ Telemetry backend
 
 Start single-region for MVP unless availability/legal requirements demand otherwise.
 
-A managed Redis service is not required initially.
+Production and staging API deployments require a secured, monitored Redis service. Redis unavailability leaves `/health/live` independent but makes `/health/ready` unavailable.
 
 The selected cloud may later be Google Cloud because of ADK integration convenience, but business/domain code must not depend on Google Cloud-specific services where a port/adapter boundary is appropriate.
 
@@ -1870,7 +1895,7 @@ A merge/release pipeline should perform, as applicable:
 13. TEST/PRODUCTION side-effect-isolation tests;
 14. container/image security scan;
 15. no-secret scan;
-16. deployment readiness/health checks.
+16. deployment readiness/health checks for PostgreSQL and Redis.
 
 Production deployment should support rollback of application version. Database rollback uses safe forward-fix patterns for migrated schemas.
 
@@ -2187,7 +2212,7 @@ After this architecture baseline, local environment preparation should occur in 
 5. initialize monorepo structure;
 6. initialize Go module and API command;
 7. initialize Next.js admin web;
-8. start PostgreSQL/Mailpit/MinIO as applicable;
+8. start PostgreSQL and Redis; start Mailpit/MinIO as applicable;
 9. create separate normal/TEST databases and least-privilege roles;
 10. configure Goose migrations;
 11. configure sqlc;
@@ -2202,11 +2227,11 @@ After this architecture baseline, local environment preparation should occur in 
 20. create initial schema migration;
 21. create Super Admin bootstrap command;
 22. create emergency auth-recovery command;
-23. create `/health` and `/ready` endpoints;
+23. create `/health/live` and `/health/ready`; readiness requires bounded successful PostgreSQL and Redis checks;
 24. configure Go/frontend/Playwright tests;
 25. configure govulncheck and secret/security checks;
 26. run full readiness test from empty environment;
-27. verify API/frontend/database start;
+27. verify API/frontend/PostgreSQL/Redis start and dependency failure behavior;
 28. verify migrations/tests/build;
 29. verify first Super Admin can be provisioned;
 30. verify TEST side-effect attempts cannot resolve production adapters.
@@ -2228,7 +2253,7 @@ The following architecture decisions are the implementation baseline represented
 | ADR-005 | pgx + sqlc explicit data-access approach |
 | ADR-006 | Goose SQL migration strategy |
 | ADR-007 | REST/OpenAPI API; SSE for streaming/progress where useful |
-| ADR-008 | PostgreSQL durable operations/outbox; no Redis required initially |
+| ADR-008 | PostgreSQL durable operations/outbox; Redis is prohibited from replacing durable authority |
 | ADR-009 | Opaque server-side Super Admin sessions with email/password/OTP |
 | ADR-010 | Secret-reference architecture with adapter-only resolution |
 | ADR-011 | S3-compatible object-storage abstraction |
@@ -2241,6 +2266,8 @@ The following architecture decisions are the implementation baseline represented
 | ADR-018 | OpenTelemetry observability standard |
 | ADR-019 | Continuous unit/integration/security/Playwright testing |
 | ADR-020 | Milestone/session cannot close until UI and backend are tested together when UI is affected |
+
+[ADR-0002](../adr/ADR-0002-required-redis-runtime.md) records Redis as a required non-authoritative runtime and API-readiness dependency while preserving the PostgreSQL durable-state decision.
 
 ---
 

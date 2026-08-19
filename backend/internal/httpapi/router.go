@@ -10,10 +10,10 @@ import (
 // ReadinessChecker defines the minimum capability required by the API
 // readiness endpoint.
 //
-// PostgreSQL implements this interface through its Ping method. Keeping the
-// interface small prevents the HTTP layer from gaining direct database access.
+// Keeping the interface small prevents the HTTP layer from gaining direct
+// PostgreSQL or Redis access.
 type ReadinessChecker interface {
-	Ping(ctx context.Context) error
+	Check(ctx context.Context) error
 }
 
 type healthResponse struct {
@@ -24,12 +24,12 @@ type healthResponse struct {
 //
 // The readiness dependency is injected instead of created inside the router.
 // This keeps infrastructure concerns separate and makes failure cases easy to
-// test without requiring a real database for every HTTP unit test.
+// test without requiring real infrastructure for every HTTP unit test.
 func NewRouter(readiness ReadinessChecker) http.Handler {
 	mux := http.NewServeMux()
 
 	// Liveness answers only one question: is this Go process alive?
-	// It deliberately does not depend on PostgreSQL or external providers.
+	// It deliberately does not depend on PostgreSQL, Redis, or other providers.
 	mux.HandleFunc("GET /health/live", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, healthResponse{Status: "alive"})
 	})
@@ -44,14 +44,14 @@ func NewRouter(readiness ReadinessChecker) http.Handler {
 			return
 		}
 
-		// Bound the database health check so a slow dependency cannot leave
-		// readiness requests hanging indefinitely.
+		// Bound all dependency checks with one deadline so a slow dependency
+		// cannot leave readiness requests hanging indefinitely.
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
 
-		if err := readiness.Ping(ctx); err != nil {
-			// Do not return raw database errors to the caller because they may
-			// reveal internal infrastructure details.
+		if err := readiness.Check(ctx); err != nil {
+			// Do not return raw dependency errors to the caller because they may
+			// reveal internal infrastructure details or credentials.
 			writeJSON(w, http.StatusServiceUnavailable, healthResponse{Status: "not_ready"})
 			return
 		}

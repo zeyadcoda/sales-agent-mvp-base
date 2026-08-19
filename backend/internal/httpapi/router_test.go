@@ -8,19 +8,25 @@ import (
 	"testing"
 )
 
-// fakeReadinessChecker lets HTTP tests simulate a healthy or failed database
-// without connecting to real infrastructure.
+// fakeReadinessChecker lets HTTP tests exercise response behavior without
+// granting the HTTP package access to real infrastructure clients.
 type fakeReadinessChecker struct {
 	err error
 }
 
-func (f fakeReadinessChecker) Ping(_ context.Context) error {
+func (f fakeReadinessChecker) Check(_ context.Context) error {
 	return f.err
 }
 
-// TestLiveness proves that the API reports itself alive independently of
-// database availability.
-func TestLiveness(t *testing.T) {
+type panicReadinessChecker struct{}
+
+func (panicReadinessChecker) Check(_ context.Context) error {
+	panic("liveness must not invoke the readiness checker")
+}
+
+// TestLivenessSucceedsWithoutDependencies proves liveness is independent of
+// PostgreSQL, Redis, and the readiness checker itself.
+func TestLivenessSucceedsWithoutDependencies(t *testing.T) {
 	t.Parallel()
 
 	req := httptest.NewRequest(http.MethodGet, "/health/live", nil)
@@ -31,61 +37,79 @@ func TestLiveness(t *testing.T) {
 	if res.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", res.Code, http.StatusOK)
 	}
-}
 
-// TestReadinessFailsClosedWithoutDependency proves that the application never
-// reports READY when its required dependency was not configured.
-func TestReadinessFailsClosedWithoutDependency(t *testing.T) {
-	t.Parallel()
+	if body := res.Body.String(); body != "{\"status\":\"alive\"}\n" {
+		t.Fatalf("body = %q, want %q", body, "{\"status\":\"alive\"}\n")
+	}
 
-	req := httptest.NewRequest(http.MethodGet, "/health/ready", nil)
-	res := httptest.NewRecorder()
-
-	NewRouter(nil).ServeHTTP(res, req)
-
-	if res.Code != http.StatusServiceUnavailable {
-		t.Fatalf(
-			"status = %d, want %d",
-			res.Code,
-			http.StatusServiceUnavailable,
-		)
+	if contentType := res.Header().Get("Content-Type"); contentType != "application/json" {
+		t.Fatalf("Content-Type = %q, want %q", contentType, "application/json")
 	}
 }
 
-// TestReadinessSucceedsWhenDatabaseIsHealthy proves that a healthy database
-// allows the API to advertise readiness.
-func TestReadinessSucceedsWhenDatabaseIsHealthy(t *testing.T) {
+func TestLivenessDoesNotCheckDependencies(t *testing.T) {
 	t.Parallel()
 
-	req := httptest.NewRequest(http.MethodGet, "/health/ready", nil)
+	req := httptest.NewRequest(http.MethodGet, "/health/live", nil)
 	res := httptest.NewRecorder()
 
-	NewRouter(fakeReadinessChecker{}).ServeHTTP(res, req)
+	NewRouter(panicReadinessChecker{}).ServeHTTP(res, req)
 
 	if res.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", res.Code, http.StatusOK)
 	}
 }
 
-// TestReadinessFailsWhenDatabaseIsUnavailable proves that infrastructure
-// failure is surfaced as NOT READY rather than a false healthy status.
-func TestReadinessFailsWhenDatabaseIsUnavailable(t *testing.T) {
+func TestReadinessResponse(t *testing.T) {
 	t.Parallel()
 
-	req := httptest.NewRequest(http.MethodGet, "/health/ready", nil)
-	res := httptest.NewRecorder()
-
-	checker := fakeReadinessChecker{
-		err: errors.New("simulated database failure"),
+	tests := []struct {
+		name       string
+		readiness  ReadinessChecker
+		wantStatus int
+		wantBody   string
+	}{
+		{
+			name:       "all required dependencies healthy",
+			readiness:  fakeReadinessChecker{},
+			wantStatus: http.StatusOK,
+			wantBody:   "{\"status\":\"ready\"}\n",
+		},
+		{
+			name: "dependency unavailable",
+			readiness: fakeReadinessChecker{
+				err: errors.New("redis://user:secret@internal.example/0"),
+			},
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   "{\"status\":\"not_ready\"}\n",
+		},
+		{
+			name:       "readiness checker missing",
+			wantStatus: http.StatusServiceUnavailable,
+			wantBody:   "{\"status\":\"not_ready\"}\n",
+		},
 	}
 
-	NewRouter(checker).ServeHTTP(res, req)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	if res.Code != http.StatusServiceUnavailable {
-		t.Fatalf(
-			"status = %d, want %d",
-			res.Code,
-			http.StatusServiceUnavailable,
-		)
+			req := httptest.NewRequest(http.MethodGet, "/health/ready", nil)
+			res := httptest.NewRecorder()
+
+			NewRouter(tt.readiness).ServeHTTP(res, req)
+
+			if res.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", res.Code, tt.wantStatus)
+			}
+
+			if body := res.Body.String(); body != tt.wantBody {
+				t.Fatalf("body = %q, want %q", body, tt.wantBody)
+			}
+
+			if contentType := res.Header().Get("Content-Type"); contentType != "application/json" {
+				t.Fatalf("Content-Type = %q, want %q", contentType, "application/json")
+			}
+		})
 	}
 }
