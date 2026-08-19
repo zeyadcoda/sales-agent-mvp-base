@@ -16,7 +16,16 @@ import (
 	"salesagent.local/backend/internal/config"
 	"salesagent.local/backend/internal/database"
 	"salesagent.local/backend/internal/httpapi"
+	"salesagent.local/backend/internal/platform/auth"
 	"salesagent.local/backend/internal/readiness"
+)
+
+const (
+	apiReadHeaderTimeout = 5 * time.Second
+	apiReadTimeout       = 15 * time.Second
+	apiWriteTimeout      = 15 * time.Second
+	apiIdleTimeout       = 60 * time.Second
+	apiMaxHeaderBytes    = 32 * 1024
 )
 
 func main() {
@@ -80,15 +89,49 @@ func run(ctx context.Context) error {
 
 	readinessChecker := readiness.New(db, redisClient)
 
-	server := &http.Server{
-		Addr:    cfg.APIAddress(),
-		Handler: httpapi.NewRouter(readinessChecker),
-
-		// ReadHeaderTimeout reduces exposure to Slowloris-style clients that
-		// intentionally send HTTP headers extremely slowly to consume server
-		// connections.
-		ReadHeaderTimeout: 5 * time.Second,
+	authStore, err := auth.NewPostgresStore(db)
+	if err != nil {
+		return fmt.Errorf("initialize authentication repository: %w", err)
 	}
+
+	passwordHasher := auth.NewPasswordHasher()
+	// Unknown accounts are verified against a real hash so the most obvious
+	// password-timing distinction does not disclose whether an email exists.
+	// The dummy password is not an account credential and is never persisted.
+	dummyPasswordHash, err := passwordHasher.Hash("timing-defense-only-not-a-real-password")
+	if err != nil {
+		return errors.New("initialize password timing defense")
+	}
+
+	authService, err := auth.NewService(
+		authStore,
+		auth.NewLoginRateLimiter(redisClient),
+		passwordHasher,
+		auth.ServiceOptions{
+			OTPBypassEnabled:  cfg.AuthOTPBypass,
+			SessionTTL:        cfg.AuthSessionTTL,
+			DummyPasswordHash: dummyPasswordHash,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("initialize authentication service: %w", err)
+	}
+
+	authHandler, err := httpapi.NewAuthHandler(authService, httpapi.AuthHandlerOptions{
+		ApplicationOrigin: cfg.AppOrigin,
+		CookieSecure:      cfg.CookieSecure(),
+		SessionTTL:        cfg.AuthSessionTTL,
+		LocalDevelopment:  cfg.AppEnvironment == config.AppLocal,
+		TrustedProxyCIDRs: cfg.AuthTrustedProxyCIDRs,
+	})
+	if err != nil {
+		return fmt.Errorf("initialize authentication HTTP handler: %w", err)
+	}
+
+	server := newAPIServer(
+		cfg.APIAddress(),
+		httpapi.NewRouter(readinessChecker, authHandler),
+	)
 
 	// Bind synchronously so shutdown can always close a known listener, even
 	// when the process context is canceled just as serving begins.
@@ -109,6 +152,21 @@ func run(ctx context.Context) error {
 	)
 
 	return serveUntilShutdown(ctx, server, listener)
+}
+
+func newAPIServer(address string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:    address,
+		Handler: handler,
+
+		// These transport bounds complement endpoint body limits. They cap slow
+		// reads, stalled handlers/writes, idle keep-alives, and oversized headers.
+		ReadHeaderTimeout: apiReadHeaderTimeout,
+		ReadTimeout:       apiReadTimeout,
+		WriteTimeout:      apiWriteTimeout,
+		IdleTimeout:       apiIdleTimeout,
+		MaxHeaderBytes:    apiMaxHeaderBytes,
+	}
 }
 
 // serveUntilShutdown drains in-flight HTTP requests before run returns and its

@@ -25,7 +25,7 @@ type healthResponse struct {
 // The readiness dependency is injected instead of created inside the router.
 // This keeps infrastructure concerns separate and makes failure cases easy to
 // test without requiring real infrastructure for every HTTP unit test.
-func NewRouter(readiness ReadinessChecker) http.Handler {
+func NewRouter(readiness ReadinessChecker, authHandlers ...*AuthHandler) http.Handler {
 	mux := http.NewServeMux()
 
 	// Liveness answers only one question: is this Go process alive?
@@ -59,7 +59,54 @@ func NewRouter(readiness ReadinessChecker) http.Handler {
 		writeJSON(w, http.StatusOK, healthResponse{Status: "ready"})
 	})
 
-	return mux
+	if len(authHandlers) > 0 && authHandlers[0] != nil {
+		authHandler := authHandlers[0]
+		mux.HandleFunc("POST /api/v1/auth/login", authHandler.Login)
+		mux.HandleFunc("GET /api/v1/auth/session", authHandler.Session)
+		mux.HandleFunc("POST /api/v1/auth/logout", authHandler.Logout)
+
+		// Method-specific patterns above remain authoritative for valid requests.
+		// This narrower API fallback replaces ServeMux's plain-text errors so all
+		// authentication responses retain the JSON and no-store contract.
+		mux.HandleFunc("/api/v1/auth", authRouteFallback)
+		mux.HandleFunc("/api/v1/auth/", authRouteFallback)
+	}
+
+	return withRequestMetadata(mux)
+}
+
+func authRouteFallback(w http.ResponseWriter, r *http.Request) {
+	setAuthNoStore(w)
+
+	var allowed string
+	switch r.URL.Path {
+	case "/api/v1/auth/login", "/api/v1/auth/logout":
+		allowed = http.MethodPost
+	case "/api/v1/auth/session":
+		allowed = http.MethodGet + ", " + http.MethodHead
+	}
+
+	if allowed != "" {
+		w.Header().Set("Allow", allowed)
+		writeAPIError(
+			w,
+			r,
+			http.StatusMethodNotAllowed,
+			"METHOD_NOT_ALLOWED",
+			"The requested method is not allowed for this endpoint.",
+			nil,
+		)
+		return
+	}
+
+	writeAPIError(
+		w,
+		r,
+		http.StatusNotFound,
+		"NOT_FOUND",
+		"The requested endpoint was not found.",
+		nil,
+	)
 }
 
 // writeJSON provides one small, consistent helper for JSON HTTP responses.
