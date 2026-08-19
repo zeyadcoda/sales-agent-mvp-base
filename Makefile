@@ -7,6 +7,10 @@ backend-test:
 	cd backend && GOTOOLCHAIN=local go test ./...
 
 api:
+	@test -f .env || (echo "ERROR: .env is missing. Copy .env.example to .env first." && exit 1)
+	@set -a; \
+	. ./.env; \
+	set +a; \
 	cd backend && go run ./cmd/api
 
 infra-up:
