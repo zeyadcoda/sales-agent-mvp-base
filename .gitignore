@@ -1,0 +1,24 @@
+# secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# frontend
+node_modules/
+.next/
+out/
+coverage/
+
+# Go
+backend/bin/
+backend/coverage.out
+
+# local runtime data
+.local/
+.tmp/
+.DS_Store
+*.log

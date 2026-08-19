@@ -1,0 +1,11 @@
+{
+  "name": "sales-agent-mvp-base",
+  "private": true,
+  "packageManager": "pnpm@10.34.5",
+  "engines": {
+    "node": "24.19.x"
+  },
+  "scripts": {
+    "check:env": "bash scripts/check-toolchain.sh"
+  }
+}
