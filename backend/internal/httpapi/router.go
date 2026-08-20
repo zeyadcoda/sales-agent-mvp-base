@@ -25,7 +25,11 @@ type healthResponse struct {
 // The readiness dependency is injected instead of created inside the router.
 // This keeps infrastructure concerns separate and makes failure cases easy to
 // test without requiring real infrastructure for every HTTP unit test.
-func NewRouter(readiness ReadinessChecker, authHandlers ...*AuthHandler) http.Handler {
+func NewRouter(
+	readiness ReadinessChecker,
+	authHandler *AuthHandler,
+	dashboardHandler *DashboardHandler,
+) http.Handler {
 	mux := http.NewServeMux()
 
 	// Liveness answers only one question: is this Go process alive?
@@ -59,8 +63,7 @@ func NewRouter(readiness ReadinessChecker, authHandlers ...*AuthHandler) http.Ha
 		writeJSON(w, http.StatusOK, healthResponse{Status: "ready"})
 	})
 
-	if len(authHandlers) > 0 && authHandlers[0] != nil {
-		authHandler := authHandlers[0]
+	if authHandler != nil {
 		mux.HandleFunc("POST /api/v1/auth/login", authHandler.Login)
 		mux.HandleFunc("POST /api/v1/auth/otp/verify", authHandler.VerifyOTP)
 		mux.HandleFunc("POST /api/v1/auth/otp/resend", authHandler.ResendOTP)
@@ -75,7 +78,42 @@ func NewRouter(readiness ReadinessChecker, authHandlers ...*AuthHandler) http.Ha
 		mux.HandleFunc("/api/v1/auth/", authRouteFallback)
 	}
 
+	if dashboardHandler != nil {
+		mux.HandleFunc("GET /api/v1/admin/dashboard", dashboardHandler.Dashboard)
+
+		// Preserve JSON, correlation, and no-store semantics for wrong methods and
+		// unknown paths within the protected admin API namespace.
+		mux.HandleFunc("/api/v1/admin", adminRouteFallback)
+		mux.HandleFunc("/api/v1/admin/", adminRouteFallback)
+	}
+
 	return withRequestMetadata(mux)
+}
+
+func adminRouteFallback(w http.ResponseWriter, r *http.Request) {
+	setAuthNoStore(w)
+
+	if r.URL.Path == "/api/v1/admin/dashboard" {
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodHead)
+		writeAPIError(
+			w,
+			r,
+			http.StatusMethodNotAllowed,
+			"METHOD_NOT_ALLOWED",
+			"The requested method is not allowed for this endpoint.",
+			nil,
+		)
+		return
+	}
+
+	writeAPIError(
+		w,
+		r,
+		http.StatusNotFound,
+		"NOT_FOUND",
+		"The requested endpoint was not found.",
+		nil,
+	)
 }
 
 func authRouteFallback(w http.ResponseWriter, r *http.Request) {

@@ -216,7 +216,7 @@ func TestLoginUsesForwardedClientIPOnlyFromTrustedProxy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAuthHandler() error = %v", err)
 	}
-	router := NewRouter(nil, handler)
+	router := NewRouter(nil, handler, nil)
 	request := newJSONRequest(
 		http.MethodPost,
 		"/api/v1/auth/login",
@@ -573,7 +573,7 @@ func testAuthRouter(
 		t.Fatalf("NewAuthHandler() error = %v", err)
 	}
 
-	return NewRouter(nil, handler)
+	return NewRouter(nil, handler, nil)
 }
 
 func newJSONRequest(method string, target string, body string) *http.Request {

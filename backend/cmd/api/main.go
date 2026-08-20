@@ -145,9 +145,14 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("initialize authentication HTTP handler: %w", err)
 	}
 
+	dashboardHandler, err := httpapi.NewDashboardHandler(authService, readinessChecker)
+	if err != nil {
+		return fmt.Errorf("initialize dashboard HTTP handler: %w", err)
+	}
+
 	server := newAPIServer(
 		cfg.APIAddress(),
-		httpapi.NewRouter(readinessChecker, authHandler),
+		httpapi.NewRouter(readinessChecker, authHandler, dashboardHandler),
 	)
 
 	// Bind synchronously so shutdown can always close a known listener, even

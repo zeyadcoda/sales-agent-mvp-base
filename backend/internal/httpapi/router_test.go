@@ -32,7 +32,7 @@ func TestLivenessSucceedsWithoutDependencies(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/health/live", nil)
 	res := httptest.NewRecorder()
 
-	NewRouter(nil).ServeHTTP(res, req)
+	NewRouter(nil, nil, nil).ServeHTTP(res, req)
 
 	if res.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", res.Code, http.StatusOK)
@@ -53,7 +53,7 @@ func TestLivenessDoesNotCheckDependencies(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/health/live", nil)
 	res := httptest.NewRecorder()
 
-	NewRouter(panicReadinessChecker{}).ServeHTTP(res, req)
+	NewRouter(panicReadinessChecker{}, nil, nil).ServeHTTP(res, req)
 
 	if res.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", res.Code, http.StatusOK)
@@ -97,7 +97,7 @@ func TestReadinessResponse(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "/health/ready", nil)
 			res := httptest.NewRecorder()
 
-			NewRouter(tt.readiness).ServeHTTP(res, req)
+			NewRouter(tt.readiness, nil, nil).ServeHTTP(res, req)
 
 			if res.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d", res.Code, tt.wantStatus)

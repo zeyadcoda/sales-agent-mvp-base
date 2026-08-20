@@ -16,6 +16,27 @@ const backendDirectory = path.resolve(
   "../../../../backend",
 );
 
+const approvedNavigation = [
+  { name: "Dashboard", path: "/dashboard" },
+  { name: "Organizations", path: "/organizations" },
+  { name: "Applications", path: "/applications" },
+  { name: "Packages", path: "/packages" },
+  { name: "AI & Usage", path: "/ai-usage" },
+  { name: "Integrations", path: "/integrations" },
+  { name: "AI Agents", path: "/ai-agents" },
+  { name: "System Health", path: "/system-health" },
+  { name: "Logs", path: "/logs" },
+  { name: "Audit", path: "/audit" },
+] as const;
+
+const dashboardSectionNames = [
+  "Needs Attention",
+  "AI Cost & Consumption",
+  "Organizations",
+  "System Health",
+  "Recent Important Activity",
+] as const;
+
 test.describe("Super Admin authentication", () => {
   test.describe.configure({ mode: "serial" });
 
@@ -55,10 +76,11 @@ test.describe("Super Admin authentication", () => {
     await expect(page.getByLabel("Password")).toHaveValue("");
   });
 
-  test("uses a real Mailpit OTP, resends safely, persists the session, and logs out", async ({
+  test("uses a real Mailpit OTP, resends safely, and exercises the protected application shell", async ({
     page,
     request,
   }) => {
+    test.setTimeout(180_000);
     test.skip(authenticationMode !== "otp", "Set E2E_AUTH_MODE=otp for the real OTP flow.");
     test.skip(!hasCredentials(), credentialsSkipReason);
     const { email, password } = credentials();
@@ -101,17 +123,9 @@ test.describe("Super Admin authentication", () => {
     await page.getByRole("button", { name: "Verify" }).click();
     await expect(page).toHaveURL(/\/dashboard$/);
     await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
-    await expect(page.getByText(email, { exact: true })).toBeVisible();
+    await expect(page.getByText(email, { exact: true }).first()).toBeVisible();
 
-    await page.reload();
-    await expect(page).toHaveURL(/\/dashboard$/);
-    await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
-
-    await page.getByRole("button", { name: "Logout" }).click();
-    await expect(page).toHaveURL(/\/login$/);
-
-    await page.goto("/dashboard");
-    await expect(page).toHaveURL(/\/login$/);
+    await exerciseProtectedApplicationShell(page, email);
   });
 
   test("locks a real challenge after five wrong codes", async ({ page, request }) => {
@@ -168,7 +182,9 @@ test.describe("Super Admin authentication", () => {
     await expect(page.getByRole("button", { name: "Restart login" })).toBeVisible();
   });
 
-  test("preserves the explicitly configured local bypass flow", async ({ page }) => {
+  test("preserves the explicitly configured local bypass flow and exercises the protected application shell", async ({
+    page,
+  }) => {
     test.skip(authenticationMode !== "bypass", "Set E2E_AUTH_MODE=bypass to test local bypass.");
     test.skip(!hasCredentials(), credentialsSkipReason);
     const { email, password } = credentials();
@@ -177,8 +193,207 @@ test.describe("Super Admin authentication", () => {
     await expect(page).toHaveURL(/\/dashboard$/);
     await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
     await expect(page.getByText("Local development", { exact: true })).toBeVisible();
+
+    await exerciseProtectedApplicationShell(page, email);
   });
 });
+
+async function exerciseProtectedApplicationShell(page: Page, email: string): Promise<void> {
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await expect(page).toHaveURL(/\/dashboard$/);
+
+  const banner = page.getByRole("banner");
+  await expect(banner.getByText(email, { exact: true }).first()).toBeVisible();
+  await expect(banner.getByText("Super Admin", { exact: true }).first()).toBeVisible();
+  const sidebar = page.getByRole("complementary", { name: "Super Admin navigation" });
+  await expect(sidebar.getByText("Sales Agent", { exact: true })).toBeVisible();
+  await expect(sidebar.getByText("Super Admin", { exact: true })).toBeVisible();
+
+  const main = page.getByRole("main");
+  await expect(
+    main.getByRole("heading", { level: 1, name: "Dashboard", exact: true }),
+  ).toBeVisible();
+  await assertApprovedNavigation(page, "Dashboard");
+  await expect(page.getByRole("button", { name: "Open navigation" })).toBeHidden();
+
+  const sectionHeadings = main.getByRole("heading", { level: 2 });
+  await expect(sectionHeadings).toHaveCount(dashboardSectionNames.length);
+  expect((await sectionHeadings.allTextContents()).map((heading) => heading.trim())).toEqual(
+    dashboardSectionNames,
+  );
+
+  const aiCostSection = main.getByRole("region", {
+    name: "AI Cost & Consumption",
+  });
+  const organizationsSection = main.getByRole("region", { name: "Organizations" });
+  const systemHealthSection = main.getByRole("region", { name: "System Health" });
+  await expect(aiCostSection).toBeVisible();
+  await expect(organizationsSection).toBeVisible();
+  await expect(systemHealthSection).toBeVisible();
+  await expect(aiCostSection.getByText(/not implemented|will populate/i)).toBeVisible();
+  await expect(organizationsSection.getByText(/not implemented|will appear/i)).toBeVisible();
+  await expect(systemHealthSection.getByText("UNKNOWN", { exact: true })).toBeVisible();
+  await expect(systemHealthSection.getByText("HEALTHY", { exact: true })).toHaveCount(0);
+  await expect(aiCostSection.getByText(/\$\s*0(?:\.00)?\b/)).toHaveCount(0);
+  await expect(aiCostSection.getByText(/\b0\s+(?:tokens?|credits?)\b/i)).toHaveCount(0);
+  await expect(organizationsSection.getByText(/\b0\s+organizations?\b/i)).toHaveCount(0);
+
+  const createOrganization = main.getByRole("link", {
+    name: "Create Organization",
+    exact: true,
+  });
+  await expect(createOrganization).toBeVisible();
+  await expect(createOrganization).toHaveAttribute("href", "/organizations");
+  await createOrganization.click();
+  await assertModulePlaceholder(page, "Organizations", "/organizations");
+
+  await page.getByRole("main").getByRole("link", { name: "Back to Dashboard" }).click();
+  await expect(page).toHaveURL(/\/dashboard$/);
+  await assertApprovedNavigation(page, "Dashboard");
+
+  for (const destination of approvedNavigation.slice(2)) {
+    await page
+      .getByRole("navigation", { name: "Primary navigation" })
+      .getByRole("link", { name: destination.name, exact: true })
+      .click();
+    await assertModulePlaceholder(page, destination.name, destination.path);
+  }
+
+  await page.reload();
+  await assertModulePlaceholder(page, "Audit", "/audit");
+
+  await page
+    .getByRole("navigation", { name: "Primary navigation" })
+    .getByRole("link", { name: "Dashboard", exact: true })
+    .click();
+  await expect(page).toHaveURL(/\/dashboard$/);
+  await expect(
+    page.getByRole("main").getByRole("heading", {
+      level: 1,
+      name: "Dashboard",
+      exact: true,
+    }),
+  ).toBeVisible();
+
+  await exerciseMobileNavigation(page);
+
+  await page.getByRole("button", { name: "Logout", exact: true }).click();
+  await expect(page).toHaveURL(/\/login$/);
+
+  await page.goto("/organizations");
+  await expect(page).toHaveURL(/\/login$/);
+  await expect(page.getByRole("heading", { name: "Super Admin sign in" })).toBeVisible();
+
+  await page.goto("/dashboard");
+  await expect(page).toHaveURL(/\/login$/);
+}
+
+async function assertApprovedNavigation(
+  page: Page,
+  currentPage: (typeof approvedNavigation)[number]["name"],
+): Promise<void> {
+  const navigation = page.getByRole("navigation", { name: "Primary navigation" });
+  await expect(navigation).toBeVisible();
+
+  const links = navigation.getByRole("link");
+  await expect(links).toHaveCount(approvedNavigation.length);
+  for (const [index, destination] of approvedNavigation.entries()) {
+    await expect(links.nth(index)).toHaveAccessibleName(destination.name);
+    await expect(links.nth(index)).toHaveAttribute("href", destination.path);
+  }
+
+  await expect(
+    navigation.getByRole("link", { name: currentPage, exact: true }),
+  ).toHaveAttribute("aria-current", "page");
+}
+
+async function assertModulePlaceholder(
+  page: Page,
+  name: (typeof approvedNavigation)[number]["name"],
+  pathName: (typeof approvedNavigation)[number]["path"],
+): Promise<void> {
+  await assertModulePlaceholderContent(page, name, pathName);
+  await assertApprovedNavigation(page, name);
+}
+
+async function assertModulePlaceholderContent(
+  page: Page,
+  name: (typeof approvedNavigation)[number]["name"],
+  pathName: (typeof approvedNavigation)[number]["path"],
+): Promise<void> {
+  await expect(page).toHaveURL(new RegExp(`${escapeRegExp(pathName)}$`));
+  const main = page.getByRole("main");
+  await expect(main.getByRole("heading", { level: 1, name, exact: true })).toBeVisible();
+  await expect(
+    main.getByText("This module has not been implemented yet.", { exact: true }),
+  ).toBeVisible();
+  await expect(main.getByRole("link", { name: "Back to Dashboard" })).toBeVisible();
+  await expect(main.getByText("404", { exact: true })).toHaveCount(0);
+}
+
+async function exerciseMobileNavigation(page: Page): Promise<void> {
+  await page.setViewportSize({ width: 390, height: 844 });
+
+  const navigation = page.getByRole("navigation", { name: "Primary navigation" });
+  const openNavigation = page.getByRole("button", { name: "Open navigation" });
+  await expect(openNavigation).toBeVisible();
+  await expect(openNavigation).toHaveAttribute("aria-expanded", "false");
+  await expect(navigation).toBeHidden();
+
+  await openNavigation.focus();
+  await page.keyboard.press("Enter");
+  const navigationDialog = page.getByRole("dialog", { name: "Super Admin navigation" });
+  const closeNavigation = navigationDialog.getByRole("button", { name: "Close navigation" });
+  await expect(navigationDialog).toBeVisible();
+  await expect(navigation).toBeVisible();
+  await expect(closeNavigation).toBeFocused();
+
+  await page.keyboard.press("Shift+Tab");
+  await expect(
+    navigation.getByRole("link", { name: "Audit", exact: true }),
+  ).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(closeNavigation).toBeFocused();
+
+  await closeNavigation.click();
+  await expect(navigation).toBeHidden();
+  await expect(openNavigation).toBeFocused();
+
+  await openNavigation.click();
+  await expect(navigation).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(navigation).toBeHidden();
+  await expect(openNavigation).toBeFocused();
+
+  await openNavigation.click();
+  await navigation.getByRole("link", { name: "AI Agents", exact: true }).click();
+  await assertModulePlaceholderContent(page, "AI Agents", "/ai-agents");
+  await expect(navigation).toBeHidden();
+  await expect(openNavigation).toHaveAttribute("aria-expanded", "false");
+
+  await openNavigation.click();
+  await assertApprovedNavigation(page, "AI Agents");
+  await page.keyboard.press("Escape");
+  await expect(navigation).toBeHidden();
+
+  await expectNoHorizontalOverflow(page);
+
+  await page.setViewportSize({ width: 768, height: 1024 });
+  await expect(openNavigation).toBeVisible();
+  await expect(navigation).toBeHidden();
+  await expectNoHorizontalOverflow(page);
+}
+
+async function expectNoHorizontalOverflow(page: Page): Promise<void> {
+  const hasHorizontalOverflow = await page.evaluate(
+    () => document.documentElement.scrollWidth > document.documentElement.clientWidth,
+  );
+  expect(hasHorizontalOverflow).toBe(false);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 async function beginSignIn(page: Page, email: string, password: string) {
   await page.goto("/login");
