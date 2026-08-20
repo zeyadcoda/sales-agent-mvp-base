@@ -8,44 +8,90 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"salesagent.local/backend/internal/requestmeta"
 )
 
 type fakeStore struct {
-	admin                      SuperAdmin
-	adminErr                   error
-	createdSession             NewSession
-	createSessionErr           error
-	createdChallenge           NewOTPChallenge
-	createChallengeErr         error
-	activatedChallengeID       string
-	activatedDeliveryVersion   int
-	activateChallengeErr       error
-	invalidatedChallengeID     string
-	invalidatedDeliveryVersion int
-	invalidateChallengeErr     error
-	resendDelivery             OTPDelivery
-	resendErr                  error
-	resendErrors               []error
-	resendHashes               [][]byte
-	verifiedChallengeID        string
-	verifiedCandidateHash      []byte
-	verifiedSession            NewSession
-	verifyAdmin                SuperAdmin
-	verifyErr                  error
-	challenge                  OTPChallenge
-	challengeErr               error
-	session                    Session
-	sessionErr                 error
-	lookupTokenHash            []byte
-	touchedSessionID           string
-	touchedAt                  time.Time
-	touchErr                   error
-	revokedSessionID           string
-	revokeErr                  error
+	admin                       SuperAdmin
+	adminErr                    error
+	hasActiveRecovery           bool
+	hasActiveRecoveryErr        error
+	recoveryChecks              int
+	recoveryCheckedAdminID      string
+	recoveryCheckedAt           time.Time
+	consumedRecoveryAdminID     string
+	consumedRecoveryAt          time.Time
+	consumedRecoverySession     NewSession
+	consumedRecoveryCorrelation string
+	consumeRecoveryCalls        int
+	consumeRecoveryErr          error
+	createdSession              NewSession
+	createSessionErr            error
+	createdChallenge            NewOTPChallenge
+	createChallengeErr          error
+	activatedChallengeID        string
+	activatedDeliveryVersion    int
+	activateChallengeErr        error
+	invalidatedChallengeID      string
+	invalidatedDeliveryVersion  int
+	invalidateChallengeErr      error
+	resendDelivery              OTPDelivery
+	resendErr                   error
+	resendErrors                []error
+	resendHashes                [][]byte
+	verifiedChallengeID         string
+	verifiedCandidateHash       []byte
+	verifiedSession             NewSession
+	verifyAdmin                 SuperAdmin
+	verifyErr                   error
+	challenge                   OTPChallenge
+	challengeErr                error
+	session                     Session
+	sessionErr                  error
+	lookupTokenHash             []byte
+	touchedSessionID            string
+	touchedAt                   time.Time
+	touchErr                    error
+	revokedSessionID            string
+	revokeErr                   error
 }
 
 func (store *fakeStore) FindSuperAdminByEmail(_ context.Context, _ string) (SuperAdmin, error) {
 	return store.admin, store.adminErr
+}
+
+func (store *fakeStore) HasActiveSuperAdminRecovery(
+	_ context.Context,
+	superAdminID string,
+	checkedAt time.Time,
+) (bool, error) {
+	store.recoveryChecks++
+	store.recoveryCheckedAdminID = superAdminID
+	store.recoveryCheckedAt = checkedAt
+	return store.hasActiveRecovery, store.hasActiveRecoveryErr
+}
+
+func (store *fakeStore) ConsumeSuperAdminRecoveryAndCreateSession(
+	_ context.Context,
+	superAdminID string,
+	consumedAt time.Time,
+	session NewSession,
+	correlationID string,
+) error {
+	store.consumeRecoveryCalls++
+	store.consumedRecoveryAdminID = superAdminID
+	store.consumedRecoveryAt = consumedAt
+	store.consumedRecoverySession = session
+	store.consumedRecoveryCorrelation = correlationID
+	if store.consumeRecoveryErr != nil {
+		return store.consumeRecoveryErr
+	}
+	if !store.hasActiveRecovery {
+		return ErrRecoveryNotActive
+	}
+	store.hasActiveRecovery = false
+	return nil
 }
 
 func (store *fakeStore) CreateSession(_ context.Context, session NewSession) error {
@@ -234,6 +280,9 @@ func TestLoginUnknownEmailAndWrongPasswordReturnSameFailure(t *testing.T) {
 			if test.store.createdSession.SuperAdminID != "" {
 				t.Fatal("invalid credentials must not create a session")
 			}
+			if test.store.recoveryChecks != 0 || test.store.consumeRecoveryCalls != 0 {
+				t.Fatal("invalid credentials must not inspect or consume recovery state")
+			}
 			if limiter.email != "admin@example.com" || limiter.ip != "192.0.2.10" {
 				t.Fatalf("limiter identity = (%q, %q)", limiter.email, limiter.ip)
 			}
@@ -245,7 +294,7 @@ func TestLoginLocalBypassCreatesIndependentHashedSession(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)
-	store := &fakeStore{admin: activeAdmin()}
+	store := &fakeStore{admin: activeAdmin(), hasActiveRecovery: true}
 	verifier := &fakePasswordVerifier{results: map[string]bool{"stored-hash": true}}
 	service := newTestService(t, store, &fakeLimiter{}, verifier, true, now)
 
@@ -282,6 +331,9 @@ func TestLoginLocalBypassCreatesIndependentHashedSession(t *testing.T) {
 	if session.SuperAdmin.PasswordHash != "" {
 		t.Fatal("password hash must not leave the auth service")
 	}
+	if store.recoveryChecks != 0 || store.consumeRecoveryCalls != 0 {
+		t.Fatal("local OTP bypass must not inspect or consume emergency recovery")
+	}
 	if !session.ExpiresAt.Equal(now.Add(8 * time.Hour)) {
 		t.Fatalf("expiry = %v, want %v", session.ExpiresAt, now.Add(8*time.Hour))
 	}
@@ -315,6 +367,156 @@ func TestLoginBypassDisabledCreatesDeliveredChallengeAndNoSession(t *testing.T) 
 	}
 	if store.activatedChallengeID != result.Challenge.ID || store.activatedDeliveryVersion != 1 {
 		t.Fatalf("activated challenge = (%q, %d)", store.activatedChallengeID, store.activatedDeliveryVersion)
+	}
+}
+
+func TestLoginCorrectPasswordConsumesRecoveryWithoutEmail(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 20, 10, 0, 0, 0, time.UTC)
+	store := &fakeStore{admin: activeAdmin(), hasActiveRecovery: true}
+	sender := &fakeOTPEmailSender{err: errors.New("notification provider unavailable")}
+	service := newRealOTPTestService(
+		t,
+		store,
+		&fakeOTPLimiter{},
+		sender,
+		now,
+		append(bytes.Repeat([]byte{31}, sessionTokenBytes), bytes.Repeat([]byte{32}, sessionTokenBytes)...),
+	)
+	ctx := requestmeta.WithCorrelationID(context.Background(), "recovery-login-correlation")
+
+	result, err := service.Login(ctx, "admin@example.com", "correct password", "192.0.2.10")
+	if err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+	if result.Authenticated == nil || result.Challenge != nil {
+		t.Fatalf("Login() result = %#v, want normal authenticated session", result)
+	}
+	if store.consumeRecoveryCalls != 1 || store.consumedRecoveryAdminID != activeAdmin().ID {
+		t.Fatalf("recovery consumption = calls:%d admin:%q", store.consumeRecoveryCalls, store.consumedRecoveryAdminID)
+	}
+	if len(sender.messages) != 0 || store.createdChallenge.ID != "" {
+		t.Fatal("valid recovery must not create or deliver an OTP challenge")
+	}
+	if store.createdSession.SuperAdminID != "" {
+		t.Fatal("recovery session must be inserted only by the consuming transaction")
+	}
+	if store.consumedRecoveryCorrelation != "recovery-login-correlation" {
+		t.Fatalf("consumption correlation = %q", store.consumedRecoveryCorrelation)
+	}
+	wantHash := sha256.Sum256([]byte(result.Authenticated.RawSessionToken))
+	if !bytes.Equal(store.consumedRecoverySession.TokenHash, wantHash[:]) ||
+		bytes.Equal(store.consumedRecoverySession.TokenHash, []byte(result.Authenticated.RawSessionToken)) {
+		t.Fatal("recovery did not persist only the normal session-token hash")
+	}
+	if store.consumedRecoverySession.SuperAdminID != activeAdmin().ID ||
+		!store.consumedRecoverySession.ExpiresAt.Equal(now.Add(8*time.Hour)) {
+		t.Fatalf("recovery session = %#v", store.consumedRecoverySession)
+	}
+}
+
+func TestLoginRecoveryIsOneTimeAndSecondLoginReturnsToOTP(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 20, 10, 5, 0, 0, time.UTC)
+	store := &fakeStore{admin: activeAdmin(), hasActiveRecovery: true}
+	sender := &fakeOTPEmailSender{}
+	randomMaterial := append(bytes.Repeat([]byte{33}, sessionTokenBytes), bytes.Repeat([]byte{34}, sessionTokenBytes)...)
+	randomMaterial = append(randomMaterial, otpRandomMaterial(35, 0)...)
+	service := newRealOTPTestService(t, store, &fakeOTPLimiter{}, sender, now, randomMaterial)
+
+	first, err := service.Login(context.Background(), "admin@example.com", "correct password", "192.0.2.10")
+	if err != nil || first.Authenticated == nil {
+		t.Fatalf("first Login() = %#v, error = %v", first, err)
+	}
+	second, err := service.Login(context.Background(), "admin@example.com", "correct password", "192.0.2.10")
+	if err != nil {
+		t.Fatalf("second Login() error = %v", err)
+	}
+	if second.Challenge == nil || second.Authenticated != nil {
+		t.Fatalf("second Login() = %#v, want OTP challenge", second)
+	}
+	if store.consumeRecoveryCalls != 1 || len(sender.messages) != 1 {
+		t.Fatalf("one-time behavior = recovery calls:%d emails:%d", store.consumeRecoveryCalls, len(sender.messages))
+	}
+}
+
+func TestLoginRecoveryRaceLoserFollowsNormalOTP(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 8, 20, 10, 10, 0, 0, time.UTC)
+	store := &fakeStore{
+		admin:              activeAdmin(),
+		hasActiveRecovery:  true,
+		consumeRecoveryErr: ErrRecoveryNotActive,
+	}
+	sender := &fakeOTPEmailSender{}
+	randomMaterial := append(bytes.Repeat([]byte{36}, sessionTokenBytes), bytes.Repeat([]byte{37}, sessionTokenBytes)...)
+	randomMaterial = append(randomMaterial, otpRandomMaterial(38, 0)...)
+	service := newRealOTPTestService(t, store, &fakeOTPLimiter{}, sender, now, randomMaterial)
+
+	result, err := service.Login(context.Background(), "admin@example.com", "correct password", "192.0.2.10")
+	if err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+	if result.Challenge == nil || result.Authenticated != nil || len(sender.messages) != 1 {
+		t.Fatalf("race-loser result = %#v, emails = %d", result, len(sender.messages))
+	}
+}
+
+func TestLoginRateLimitFailurePreventsRecovery(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeStore{admin: activeAdmin(), hasActiveRecovery: true}
+	service, err := NewService(
+		store,
+		&fakeLimiter{err: ErrRateLimitUnavailable},
+		&fakeOTPLimiter{},
+		&fakePasswordVerifier{results: map[string]bool{"stored-hash": true}},
+		&fakeOTPEmailSender{},
+		ServiceOptions{
+			OTPHashSecret:     bytes.Repeat([]byte{7}, otpHashSecretMinBytes),
+			SessionTTL:        8 * time.Hour,
+			DummyPasswordHash: "dummy-hash",
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	_, err = service.Login(context.Background(), "admin@example.com", "correct password", "192.0.2.10")
+	if !errors.Is(err, ErrAuthenticationUnavailable) {
+		t.Fatalf("Login() error = %v, want fail-closed unavailable", err)
+	}
+	if store.recoveryChecks != 0 || store.consumeRecoveryCalls != 0 {
+		t.Fatal("Redis failure must stop login before recovery state is inspected")
+	}
+}
+
+func TestLoginRecoveryLookupFailureFailsClosedWithoutEmail(t *testing.T) {
+	t.Parallel()
+
+	store := &fakeStore{
+		admin:                activeAdmin(),
+		hasActiveRecoveryErr: errors.New("raw PostgreSQL detail"),
+	}
+	sender := &fakeOTPEmailSender{}
+	service := newRealOTPTestService(
+		t,
+		store,
+		&fakeOTPLimiter{},
+		sender,
+		time.Now().UTC(),
+		otpRandomMaterial(40, 0),
+	)
+
+	_, err := service.Login(context.Background(), "admin@example.com", "correct password", "192.0.2.10")
+	if !errors.Is(err, ErrAuthenticationUnavailable) {
+		t.Fatalf("Login() error = %v, want safe unavailable", err)
+	}
+	if len(sender.messages) != 0 || store.createdChallenge.ID != "" || store.consumeRecoveryCalls != 0 {
+		t.Fatal("recovery lookup failure must fail closed before OTP delivery or session creation")
 	}
 }
 

@@ -5,9 +5,9 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"net/http"
-)
 
-type correlationIDKey struct{}
+	"salesagent.local/backend/internal/requestmeta"
+)
 
 type fieldError struct {
 	Field   string `json:"field"`
@@ -31,7 +31,7 @@ type errorEnvelope struct {
 func withRequestMetadata(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		correlationID := newCorrelationID()
-		ctx := context.WithValue(r.Context(), correlationIDKey{}, correlationID)
+		ctx := requestmeta.WithCorrelationID(r.Context(), correlationID)
 
 		w.Header().Set("X-Correlation-ID", correlationID)
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -55,12 +55,7 @@ func newCorrelationID() string {
 }
 
 func correlationID(ctx context.Context) string {
-	value, _ := ctx.Value(correlationIDKey{}).(string)
-	if value == "" {
-		return "unavailable"
-	}
-
-	return value
+	return requestmeta.CorrelationID(ctx)
 }
 
 func writeAPIError(

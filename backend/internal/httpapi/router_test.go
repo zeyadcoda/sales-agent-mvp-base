@@ -157,6 +157,20 @@ func TestAuthRouteErrorsRetainJSONNoStoreAndAllowSemantics(t *testing.T) {
 			wantCode:   "NOT_FOUND",
 		},
 		{
+			name:       "no browser recovery endpoint",
+			method:     http.MethodPost,
+			target:     "/api/v1/auth/recovery",
+			wantStatus: http.StatusNotFound,
+			wantCode:   "NOT_FOUND",
+		},
+		{
+			name:       "no hidden browser recovery authorization endpoint",
+			method:     http.MethodPost,
+			target:     "/api/v1/auth/recovery/authorize",
+			wantStatus: http.StatusNotFound,
+			wantCode:   "NOT_FOUND",
+		},
+		{
 			name:       "auth prefix without route",
 			method:     http.MethodGet,
 			target:     "/api/v1/auth",

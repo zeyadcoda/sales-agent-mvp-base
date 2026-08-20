@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"time"
+
+	"salesagent.local/backend/internal/requestmeta"
 )
 
 const (
@@ -107,9 +109,11 @@ func NewService(
 	}, nil
 }
 
-// Login verifies the password before applying the local-only OTP bypass. A
-// production password match creates only an inactive challenge, which becomes
-// browser-visible after successful email delivery and conditional activation.
+// Login verifies the password before applying either server-authorized
+// exception. Local bypass remains first and local-only. In real OTP mode, a
+// one-time deployment recovery may create the normal session; otherwise the
+// password match creates only an inactive challenge that becomes
+// browser-visible after successful email delivery and activation.
 func (s *Service) Login(
 	ctx context.Context,
 	email string,
@@ -159,6 +163,45 @@ func (s *Service) Login(
 		return LoginResult{Authenticated: &authenticated}, nil
 	}
 
+	// Emergency recovery is deliberately below Redis throttling, account-state
+	// validation, and correct password verification. This read is only a hint
+	// that avoids generating and discarding session material on ordinary OTP
+	// logins; the consuming transaction rechecks every condition atomically.
+	recoveryCheckedAt := s.now().UTC()
+	hasRecovery, err := s.store.HasActiveSuperAdminRecovery(
+		ctx,
+		admin.ID,
+		recoveryCheckedAt,
+	)
+	if err != nil {
+		return LoginResult{}, ErrAuthenticationUnavailable
+	}
+	if hasRecovery {
+		consumedAt := s.now().UTC()
+		authenticated, session, err := s.prepareAuthenticatedLogin(admin, consumedAt)
+		if err != nil {
+			return LoginResult{}, err
+		}
+
+		err = s.store.ConsumeSuperAdminRecoveryAndCreateSession(
+			ctx,
+			admin.ID,
+			consumedAt,
+			session,
+			requestmeta.CorrelationID(ctx),
+		)
+		switch {
+		case err == nil:
+			return LoginResult{Authenticated: &authenticated}, nil
+		case errors.Is(err, ErrRecoveryNotActive):
+			// Another correct-password request may have consumed or revoked the
+			// grant after the read hint. This request receives no recovery session
+			// and follows the normal OTP path.
+		default:
+			return LoginResult{}, ErrAuthenticationUnavailable
+		}
+	}
+
 	challenge, err := s.createAndDeliverOTPChallenge(ctx, admin)
 	if err != nil {
 		return LoginResult{}, err
@@ -171,28 +214,45 @@ func (s *Service) createAuthenticatedLogin(
 	ctx context.Context,
 	admin SuperAdmin,
 ) (AuthenticatedLogin, error) {
+	now := s.now().UTC()
+	authenticated, session, err := s.prepareAuthenticatedLogin(admin, now)
+	if err != nil {
+		return AuthenticatedLogin{}, err
+	}
+
+	if err := s.store.CreateSession(ctx, session); err != nil {
+		return AuthenticatedLogin{}, ErrAuthenticationUnavailable
+	}
+
+	return authenticated, nil
+}
+
+// prepareAuthenticatedLogin creates the exact same independent session and
+// CSRF material for local bypass and emergency recovery. Persistence remains a
+// separate step so recovery consumption, session insertion, and Audit can be
+// committed by PostgreSQL as one transaction.
+func (s *Service) prepareAuthenticatedLogin(
+	admin SuperAdmin,
+	now time.Time,
+) (AuthenticatedLogin, NewSession, error) {
 	rawSessionToken, err := generateOpaqueToken(s.random)
 	if err != nil {
-		return AuthenticatedLogin{}, ErrAuthenticationUnavailable
+		return AuthenticatedLogin{}, NewSession{}, ErrAuthenticationUnavailable
 	}
 	csrfToken, err := generateOpaqueToken(s.random)
 	if err != nil {
-		return AuthenticatedLogin{}, ErrAuthenticationUnavailable
+		return AuthenticatedLogin{}, NewSession{}, ErrAuthenticationUnavailable
 	}
 
-	now := s.now().UTC()
 	expiresAt := now.Add(s.sessionTTL)
 	tokenHash := hashSessionToken(rawSessionToken)
-
-	if err := s.store.CreateSession(ctx, NewSession{
+	session := NewSession{
 		SuperAdminID: admin.ID,
 		TokenHash:    tokenHash[:],
 		CSRFToken:    csrfToken,
 		CreatedAt:    now,
 		ExpiresAt:    expiresAt,
 		LastSeenAt:   now,
-	}); err != nil {
-		return AuthenticatedLogin{}, ErrAuthenticationUnavailable
 	}
 
 	return AuthenticatedLogin{
@@ -202,7 +262,7 @@ func (s *Service) createAuthenticatedLogin(
 			ExpiresAt:  expiresAt,
 		},
 		RawSessionToken: rawSessionToken,
-	}, nil
+	}, session, nil
 }
 
 func (s *Service) createAndDeliverOTPChallenge(
