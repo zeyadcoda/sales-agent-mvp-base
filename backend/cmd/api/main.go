@@ -16,6 +16,7 @@ import (
 	"salesagent.local/backend/internal/config"
 	"salesagent.local/backend/internal/database"
 	"salesagent.local/backend/internal/httpapi"
+	notificationemail "salesagent.local/backend/internal/notification/email"
 	"salesagent.local/backend/internal/platform/auth"
 	"salesagent.local/backend/internal/readiness"
 )
@@ -23,9 +24,12 @@ import (
 const (
 	apiReadHeaderTimeout = 5 * time.Second
 	apiReadTimeout       = 15 * time.Second
-	apiWriteTimeout      = 15 * time.Second
-	apiIdleTimeout       = 60 * time.Second
-	apiMaxHeaderBytes    = 32 * 1024
+	// Authentication may include a provider SMTP operation bounded at 30
+	// seconds plus the final PostgreSQL activation. Keep the transport budget
+	// above the handler budget so valid configured delivery cannot be cut off.
+	apiWriteTimeout   = 45 * time.Second
+	apiIdleTimeout    = 60 * time.Second
+	apiMaxHeaderBytes = 32 * 1024
 )
 
 func main() {
@@ -103,12 +107,25 @@ func run(ctx context.Context) error {
 		return errors.New("initialize password timing defense")
 	}
 
+	var otpEmailSender auth.OTPEmailSender
+	var otpRateLimiter auth.OTPRateLimiter
+	if !cfg.AuthOTPBypass {
+		otpEmailSender, err = notificationemail.NewSender(cfg.AuthEmail)
+		if err != nil {
+			return fmt.Errorf("initialize authentication email sender: %w", err)
+		}
+		otpRateLimiter = auth.NewOTPRateLimiter(redisClient)
+	}
+
 	authService, err := auth.NewService(
 		authStore,
 		auth.NewLoginRateLimiter(redisClient),
+		otpRateLimiter,
 		passwordHasher,
+		otpEmailSender,
 		auth.ServiceOptions{
 			OTPBypassEnabled:  cfg.AuthOTPBypass,
+			OTPHashSecret:     cfg.AuthOTPHMACSecret,
 			SessionTTL:        cfg.AuthSessionTTL,
 			DummyPasswordHash: dummyPasswordHash,
 		},

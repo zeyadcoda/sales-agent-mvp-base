@@ -15,18 +15,43 @@ import (
 	"salesagent.local/backend/internal/platform/auth"
 )
 
-const testApplicationOrigin = "http://127.0.0.1:3000"
+const testApplicationOrigin = "http://127.0.0.1:3001"
 
 type fakeAuthenticationService struct {
-	loginSession  auth.AuthenticatedSession
-	loginToken    string
-	loginErr      error
-	loginCalls    int
-	loginEmail    string
-	loginPassword string
-	loginIP       string
-	loginDeadline time.Time
-	loginHasLimit bool
+	loginSession   auth.AuthenticatedSession
+	loginToken     string
+	loginChallenge *auth.PendingChallenge
+	loginErr       error
+	loginCalls     int
+	loginEmail     string
+	loginPassword  string
+	loginIP        string
+	loginDeadline  time.Time
+	loginHasLimit  bool
+
+	verifyLogin       auth.AuthenticatedLogin
+	verifyErr         error
+	verifyCalls       int
+	verifyChallengeID string
+	verifyOTP         string
+	verifyIP          string
+	verifyDeadline    time.Time
+	verifyHasLimit    bool
+
+	resendChallenge   auth.PendingChallenge
+	resendErr         error
+	resendCalls       int
+	resendChallengeID string
+	resendIP          string
+	resendDeadline    time.Time
+	resendHasLimit    bool
+
+	statusChallenge   auth.ChallengeState
+	statusErr         error
+	statusCalls       int
+	statusChallengeID string
+	statusDeadline    time.Time
+	statusHasLimit    bool
 
 	resolvedSession auth.AuthenticatedSession
 	resolveErr      error
@@ -46,13 +71,59 @@ func (service *fakeAuthenticationService) Login(
 	email string,
 	password string,
 	ip string,
-) (auth.AuthenticatedSession, string, error) {
+) (auth.LoginResult, error) {
 	service.loginDeadline, service.loginHasLimit = ctx.Deadline()
 	service.loginCalls++
 	service.loginEmail = email
 	service.loginPassword = password
 	service.loginIP = ip
-	return service.loginSession, service.loginToken, service.loginErr
+	if service.loginErr != nil {
+		return auth.LoginResult{}, service.loginErr
+	}
+	if service.loginChallenge != nil {
+		return auth.LoginResult{Challenge: service.loginChallenge}, nil
+	}
+
+	return auth.LoginResult{Authenticated: &auth.AuthenticatedLogin{
+		Session:         service.loginSession,
+		RawSessionToken: service.loginToken,
+	}}, nil
+}
+
+func (service *fakeAuthenticationService) VerifyOTP(
+	ctx context.Context,
+	challengeID string,
+	otp string,
+	ip string,
+) (auth.AuthenticatedLogin, error) {
+	service.verifyDeadline, service.verifyHasLimit = ctx.Deadline()
+	service.verifyCalls++
+	service.verifyChallengeID = challengeID
+	service.verifyOTP = otp
+	service.verifyIP = ip
+	return service.verifyLogin, service.verifyErr
+}
+
+func (service *fakeAuthenticationService) ResendOTP(
+	ctx context.Context,
+	challengeID string,
+	ip string,
+) (auth.PendingChallenge, error) {
+	service.resendDeadline, service.resendHasLimit = ctx.Deadline()
+	service.resendCalls++
+	service.resendChallengeID = challengeID
+	service.resendIP = ip
+	return service.resendChallenge, service.resendErr
+}
+
+func (service *fakeAuthenticationService) GetOTPChallengeStatus(
+	ctx context.Context,
+	challengeID string,
+) (auth.ChallengeState, error) {
+	service.statusDeadline, service.statusHasLimit = ctx.Deadline()
+	service.statusCalls++
+	service.statusChallengeID = challengeID
+	return service.statusChallenge, service.statusErr
 }
 
 func (service *fakeAuthenticationService) ResolveSession(
@@ -530,6 +601,19 @@ func assertBoundedAuthDeadline(t *testing.T, deadline time.Time, hasDeadline boo
 			"authentication service deadline has %s remaining, want within (0, %s]",
 			remaining,
 			authServiceOperationTimeout,
+		)
+	}
+}
+
+func TestAuthenticationOperationBudgetExceedsMaximumSMTPTimeout(t *testing.T) {
+	t.Parallel()
+
+	const maximumConfiguredSMTPTimeout = 30 * time.Second
+	if authServiceOperationTimeout <= maximumConfiguredSMTPTimeout {
+		t.Fatalf(
+			"authentication operation timeout = %s, must exceed maximum SMTP timeout %s",
+			authServiceOperationTimeout,
+			maximumConfiguredSMTPTimeout,
 		)
 	}
 }

@@ -92,6 +92,22 @@ func TestIncrementLoginAttemptCountersRejectsMissingClient(t *testing.T) {
 	}
 }
 
+func TestIncrementOTPAttemptCountersRejectsMissingClient(t *testing.T) {
+	t.Parallel()
+
+	var client *Redis
+
+	_, _, err := client.IncrementOTPAttemptCounters(
+		context.Background(),
+		"opaque-challenge-key",
+		"opaque-ip-key",
+		15*time.Minute,
+	)
+	if !errors.Is(err, ErrRedisNotInitialized) {
+		t.Fatalf("error = %v, want %v", err, ErrRedisNotInitialized)
+	}
+}
+
 func TestIncrementLoginAttemptCountersRejectsInvalidInput(t *testing.T) {
 	t.Parallel()
 
@@ -165,6 +181,36 @@ func TestIncrementLoginAttemptCountersReturnsRedisError(t *testing.T) {
 	}
 }
 
+func TestIncrementOTPAttemptCountersReturnsRedisError(t *testing.T) {
+	t.Parallel()
+
+	client, err := Open("redis://127.0.0.1:6379/0")
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("close Redis client: %v", err)
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	challengeAttempts, ipAttempts, err := client.IncrementOTPAttemptCounters(
+		ctx,
+		"opaque-challenge-key",
+		"opaque-ip-key",
+		15*time.Minute,
+	)
+	if err == nil {
+		t.Fatal("expected Redis failure, got nil")
+	}
+	if challengeAttempts != 0 || ipAttempts != 0 {
+		t.Fatalf("attempts = (%d, %d), want (0, 0) on Redis failure", challengeAttempts, ipAttempts)
+	}
+}
+
 func TestIncrementLoginAttemptCountersWithRedis(t *testing.T) {
 	redisURL := os.Getenv("TEST_REDIS_URL")
 	if redisURL == "" {
@@ -217,6 +263,68 @@ func TestIncrementLoginAttemptCountersWithRedis(t *testing.T) {
 	}
 
 	for _, key := range []string{emailKey, ipKey} {
+		ttl, err := client.client.PTTL(ctx, key).Result()
+		if err != nil {
+			t.Fatalf("read TTL for %q: %v", key, err)
+		}
+		if ttl <= 0 || ttl > window {
+			t.Fatalf("TTL for %q = %s, want within (0, %s]", key, ttl, window)
+		}
+	}
+}
+
+func TestIncrementOTPAttemptCountersWithRedis(t *testing.T) {
+	redisURL := os.Getenv("TEST_REDIS_URL")
+	if redisURL == "" {
+		t.Skip("TEST_REDIS_URL is not set; skipping Redis OTP rate-limit integration test")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	client, err := Open(redisURL)
+	if err != nil {
+		t.Fatalf("open Redis client: %v", err)
+	}
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("close Redis client: %v", err)
+		}
+	}()
+
+	unique := time.Now().UnixNano()
+	challengeKey := fmt.Sprintf("sales-agent:test:{attempts}:otp-challenge:%d", unique)
+	ipKey := fmt.Sprintf("sales-agent:test:{attempts}:otp-ip:%d", unique)
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Second)
+		defer cleanupCancel()
+		_ = client.client.Del(cleanupCtx, challengeKey, ipKey).Err()
+	})
+
+	window := 15 * time.Minute
+	for want := int64(1); want <= 2; want++ {
+		challengeAttempts, ipAttempts, err := client.IncrementOTPAttemptCounters(
+			ctx,
+			challengeKey,
+			ipKey,
+			window,
+		)
+		if err != nil {
+			t.Fatalf("increment %d: %v", want, err)
+		}
+		if challengeAttempts != want || ipAttempts != want {
+			t.Fatalf(
+				"increment %d returned (%d, %d), want (%d, %d)",
+				want,
+				challengeAttempts,
+				ipAttempts,
+				want,
+				want,
+			)
+		}
+	}
+
+	for _, key := range []string{challengeKey, ipKey} {
 		ttl, err := client.client.PTTL(ctx, key).Result()
 		if err != nil {
 			t.Fatalf("read TTL for %q: %v", key, err)

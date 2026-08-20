@@ -58,4 +58,7 @@ func TestAPIServerHasBoundedTransportSettings(t *testing.T) {
 			server.MaxHeaderBytes,
 		)
 	}
+	if server.WriteTimeout <= 40*time.Second {
+		t.Fatalf("server write timeout = %s, must exceed the authentication handler budget", server.WriteTimeout)
+	}
 }

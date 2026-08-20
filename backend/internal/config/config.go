@@ -47,6 +47,10 @@ type Config struct {
 	// outside APP_ENV=local so it cannot become a production auth path.
 	AuthOTPBypass  bool
 	AuthSessionTTL time.Duration
+	// AuthOTPHMACSecret is decoded key material used to protect low-entropy OTP
+	// values at rest. It is empty only for the local development bypass.
+	AuthOTPHMACSecret []byte
+	AuthEmail         AuthEmailConfig
 	// AuthTrustedProxyCIDRs defines the only network peers whose forwarded
 	// client-address chain the authentication rate limiter may trust.
 	AuthTrustedProxyCIDRs []netip.Prefix
@@ -97,6 +101,15 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("AUTH_OTP_BYPASS may be enabled only when APP_ENV=local")
 	}
 
+	var authOTPHMACSecret []byte
+	var authEmail AuthEmailConfig
+	if !authOTPBypass {
+		authOTPHMACSecret, authEmail, err = loadAuthOTPConfiguration(appEnvironment)
+		if err != nil {
+			return Config{}, err
+		}
+	}
+
 	authSessionTTL, err := parseAuthSessionTTL(os.Getenv("AUTH_SESSION_TTL"))
 	if err != nil {
 		return Config{}, err
@@ -135,6 +148,8 @@ func Load() (Config, error) {
 		AppOrigin:             appOrigin,
 		AuthOTPBypass:         authOTPBypass,
 		AuthSessionTTL:        authSessionTTL,
+		AuthOTPHMACSecret:     authOTPHMACSecret,
+		AuthEmail:             authEmail,
 		AuthTrustedProxyCIDRs: authTrustedProxyCIDRs,
 		DatabaseURL:           databaseURL,
 		RedisURL:              redisURL,

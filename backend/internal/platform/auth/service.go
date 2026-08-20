@@ -12,7 +12,10 @@ import (
 	"time"
 )
 
-const sessionTokenBytes = 32
+const (
+	sessionTokenBytes = 32
+	otpCleanupTimeout = 2 * time.Second
+)
 
 // PasswordVerifier is kept narrow so authentication tests can prove account
 // enumeration and failure behavior without weakening production hashing.
@@ -28,6 +31,7 @@ type LoginRateLimiter interface {
 
 type ServiceOptions struct {
 	OTPBypassEnabled  bool
+	OTPHashSecret     []byte
 	SessionTTL        time.Duration
 	DummyPasswordHash string
 	Random            io.Reader
@@ -39,8 +43,11 @@ type ServiceOptions struct {
 // session checks by constructing their own response.
 type Service struct {
 	store             Store
-	limiter           LoginRateLimiter
+	loginLimiter      LoginRateLimiter
+	otpLimiter        OTPRateLimiter
 	passwords         PasswordVerifier
+	emailSender       OTPEmailSender
+	otpHasher         *otpHasher
 	otpBypassEnabled  bool
 	sessionTTL        time.Duration
 	dummyPasswordHash string
@@ -50,11 +57,13 @@ type Service struct {
 
 func NewService(
 	store Store,
-	limiter LoginRateLimiter,
+	loginLimiter LoginRateLimiter,
+	otpLimiter OTPRateLimiter,
 	passwords PasswordVerifier,
+	emailSender OTPEmailSender,
 	options ServiceOptions,
 ) (*Service, error) {
-	if store == nil || limiter == nil || passwords == nil {
+	if store == nil || loginLimiter == nil || passwords == nil {
 		return nil, errors.New("authentication dependencies are required")
 	}
 	if options.SessionTTL <= 0 {
@@ -62,6 +71,18 @@ func NewService(
 	}
 	if options.DummyPasswordHash == "" {
 		return nil, errors.New("dummy password hash is required")
+	}
+
+	var hasher *otpHasher
+	if len(options.OTPHashSecret) > 0 {
+		var err error
+		hasher, err = newOTPHasher(options.OTPHashSecret)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if !options.OTPBypassEnabled && (otpLimiter == nil || emailSender == nil || hasher == nil) {
+		return nil, errors.New("OTP authentication dependencies are required when bypass is disabled")
 	}
 
 	if options.Random == nil {
@@ -73,8 +94,11 @@ func NewService(
 
 	return &Service{
 		store:             store,
-		limiter:           limiter,
+		loginLimiter:      loginLimiter,
+		otpLimiter:        otpLimiter,
 		passwords:         passwords,
+		emailSender:       emailSender,
+		otpHasher:         hasher,
 		otpBypassEnabled:  options.OTPBypassEnabled,
 		sessionTTL:        options.SessionTTL,
 		dummyPasswordHash: options.DummyPasswordHash,
@@ -83,28 +107,28 @@ func NewService(
 	}, nil
 }
 
-// Login verifies the password before applying the local-only OTP bypass. When
-// the bypass is disabled, correct credentials stop at ErrOTPRequired and no
-// authenticated session is created.
+// Login verifies the password before applying the local-only OTP bypass. A
+// production password match creates only an inactive challenge, which becomes
+// browser-visible after successful email delivery and conditional activation.
 func (s *Service) Login(
 	ctx context.Context,
 	email string,
 	password string,
 	requestingIP string,
-) (AuthenticatedSession, string, error) {
+) (LoginResult, error) {
 	normalizedEmail, err := NormalizeEmail(email)
 	if err != nil || ValidateLoginPassword(password) != nil {
-		return AuthenticatedSession{}, "", ErrInvalidCredentials
+		return LoginResult{}, ErrInvalidCredentials
 	}
 
-	if err := s.limiter.Allow(ctx, normalizedEmail, requestingIP); err != nil {
+	if err := s.loginLimiter.Allow(ctx, normalizedEmail, requestingIP); err != nil {
 		if errors.Is(err, ErrRateLimited) {
-			return AuthenticatedSession{}, "", ErrRateLimited
+			return LoginResult{}, ErrRateLimited
 		}
 
 		// Redis failure must never permit password verification or session
 		// creation. Its internal error is deliberately collapsed here.
-		return AuthenticatedSession{}, "", ErrAuthenticationUnavailable
+		return LoginResult{}, ErrAuthenticationUnavailable
 	}
 
 	admin, err := s.store.FindSuperAdminByEmail(ctx, normalizedEmail)
@@ -112,31 +136,48 @@ func (s *Service) Login(
 		// Verify against a real Argon2id hash even for unknown accounts to
 		// reduce obvious account-enumeration timing differences.
 		_, _ = s.passwords.Verify(s.dummyPasswordHash, password)
-		return AuthenticatedSession{}, "", ErrInvalidCredentials
+		return LoginResult{}, ErrInvalidCredentials
 	}
 	if err != nil {
-		return AuthenticatedSession{}, "", ErrAuthenticationUnavailable
+		return LoginResult{}, ErrAuthenticationUnavailable
 	}
 
 	passwordMatches, err := s.passwords.Verify(admin.PasswordHash, password)
 	if err != nil {
-		return AuthenticatedSession{}, "", ErrAuthenticationUnavailable
+		return LoginResult{}, ErrAuthenticationUnavailable
 	}
 	if !passwordMatches || !admin.IsActive {
-		return AuthenticatedSession{}, "", ErrInvalidCredentials
+		return LoginResult{}, ErrInvalidCredentials
 	}
 
-	if !s.otpBypassEnabled {
-		return AuthenticatedSession{}, "", ErrOTPRequired
+	if s.otpBypassEnabled {
+		authenticated, err := s.createAuthenticatedLogin(ctx, admin)
+		if err != nil {
+			return LoginResult{}, err
+		}
+
+		return LoginResult{Authenticated: &authenticated}, nil
 	}
 
+	challenge, err := s.createAndDeliverOTPChallenge(ctx, admin)
+	if err != nil {
+		return LoginResult{}, err
+	}
+
+	return LoginResult{Challenge: &challenge}, nil
+}
+
+func (s *Service) createAuthenticatedLogin(
+	ctx context.Context,
+	admin SuperAdmin,
+) (AuthenticatedLogin, error) {
 	rawSessionToken, err := generateOpaqueToken(s.random)
 	if err != nil {
-		return AuthenticatedSession{}, "", ErrAuthenticationUnavailable
+		return AuthenticatedLogin{}, ErrAuthenticationUnavailable
 	}
 	csrfToken, err := generateOpaqueToken(s.random)
 	if err != nil {
-		return AuthenticatedSession{}, "", ErrAuthenticationUnavailable
+		return AuthenticatedLogin{}, ErrAuthenticationUnavailable
 	}
 
 	now := s.now().UTC()
@@ -151,14 +192,311 @@ func (s *Service) Login(
 		ExpiresAt:    expiresAt,
 		LastSeenAt:   now,
 	}); err != nil {
-		return AuthenticatedSession{}, "", ErrAuthenticationUnavailable
+		return AuthenticatedLogin{}, ErrAuthenticationUnavailable
 	}
 
-	return AuthenticatedSession{
-		SuperAdmin: publicSuperAdmin(admin),
-		CSRFToken:  csrfToken,
-		ExpiresAt:  expiresAt,
-	}, rawSessionToken, nil
+	return AuthenticatedLogin{
+		Session: AuthenticatedSession{
+			SuperAdmin: publicSuperAdmin(admin),
+			CSRFToken:  csrfToken,
+			ExpiresAt:  expiresAt,
+		},
+		RawSessionToken: rawSessionToken,
+	}, nil
+}
+
+func (s *Service) createAndDeliverOTPChallenge(
+	ctx context.Context,
+	admin SuperAdmin,
+) (PendingChallenge, error) {
+	if !s.realOTPAvailable() {
+		return PendingChallenge{}, ErrAuthenticationUnavailable
+	}
+
+	challengeID, err := generateChallengeID(s.random)
+	if err != nil {
+		return PendingChallenge{}, ErrAuthenticationUnavailable
+	}
+	otp, err := generateSixDigitOTP(s.random)
+	if err != nil {
+		return PendingChallenge{}, ErrAuthenticationUnavailable
+	}
+	digest, err := s.otpHasher.hash(challengeID, otp)
+	if err != nil {
+		return PendingChallenge{}, ErrAuthenticationUnavailable
+	}
+
+	now := s.now().UTC()
+	expiresAt := now.Add(otpValidity)
+	resendAvailableAt := now.Add(otpResendCooldown)
+	const deliveryVersion = 1
+	if err := s.store.CreateOTPChallenge(ctx, NewOTPChallenge{
+		ID:                challengeID,
+		SuperAdminID:      admin.ID,
+		OTPHash:           digest[:],
+		CreatedAt:         now,
+		ExpiresAt:         expiresAt,
+		ResendAvailableAt: resendAvailableAt,
+		DeliveryVersion:   deliveryVersion,
+		DeliveryStartedAt: now,
+	}); err != nil {
+		return PendingChallenge{}, ErrAuthenticationUnavailable
+	}
+
+	if err := s.emailSender.SendOTP(ctx, OTPEmail{
+		RecipientEmail: admin.Email,
+		DisplayName:    admin.DisplayName,
+		OTP:            otp,
+		ExpiresAt:      expiresAt,
+	}); err != nil {
+		s.invalidateFailedDelivery(ctx, challengeID, deliveryVersion)
+		return PendingChallenge{}, ErrAuthenticationUnavailable
+	}
+	if err := s.store.ActivateOTPChallenge(ctx, challengeID, deliveryVersion, s.now().UTC()); err != nil {
+		s.invalidateFailedDelivery(ctx, challengeID, deliveryVersion)
+		return PendingChallenge{}, ErrAuthenticationUnavailable
+	}
+
+	return pendingChallenge(challengeID, admin.Email, expiresAt, resendAvailableAt), nil
+}
+
+// VerifyOTP lets PostgreSQL serialize the lifecycle check, failed-attempt
+// update, challenge consumption, and session insert in one transaction.
+func (s *Service) VerifyOTP(
+	ctx context.Context,
+	challengeID string,
+	otp string,
+	requestingIP string,
+) (AuthenticatedLogin, error) {
+	if !s.realOTPAvailable() {
+		return AuthenticatedLogin{}, ErrAuthenticationUnavailable
+	}
+	if !validChallengeID(challengeID) || !validOTP(otp) {
+		return AuthenticatedLogin{}, ErrOTPInvalid
+	}
+	if err := s.otpLimiter.AllowVerify(ctx, challengeID, requestingIP); err != nil {
+		if errors.Is(err, ErrOTPVerifyRateLimited) {
+			return AuthenticatedLogin{}, ErrOTPVerifyRateLimited
+		}
+		return AuthenticatedLogin{}, ErrAuthenticationUnavailable
+	}
+
+	digest, err := s.otpHasher.hash(challengeID, otp)
+	if err != nil {
+		return AuthenticatedLogin{}, ErrAuthenticationUnavailable
+	}
+	rawSessionToken, err := generateOpaqueToken(s.random)
+	if err != nil {
+		return AuthenticatedLogin{}, ErrAuthenticationUnavailable
+	}
+	csrfToken, err := generateOpaqueToken(s.random)
+	if err != nil {
+		return AuthenticatedLogin{}, ErrAuthenticationUnavailable
+	}
+
+	now := s.now().UTC()
+	expiresAt := now.Add(s.sessionTTL)
+	tokenHash := hashSessionToken(rawSessionToken)
+	admin, err := s.store.VerifyOTPChallengeAndCreateSession(
+		ctx,
+		challengeID,
+		digest[:],
+		now,
+		NewSession{
+			TokenHash:  tokenHash[:],
+			CSRFToken:  csrfToken,
+			CreatedAt:  now,
+			ExpiresAt:  expiresAt,
+			LastSeenAt: now,
+		},
+	)
+	if err != nil {
+		return AuthenticatedLogin{}, publicOTPError(err)
+	}
+
+	return AuthenticatedLogin{
+		Session: AuthenticatedSession{
+			SuperAdmin: publicSuperAdmin(admin),
+			CSRFToken:  csrfToken,
+			ExpiresAt:  expiresAt,
+		},
+		RawSessionToken: rawSessionToken,
+	}, nil
+}
+
+// ResendOTP rotates PostgreSQL state before calling email. A send failure
+// invalidates the pending version; it never revives the previous code.
+func (s *Service) ResendOTP(
+	ctx context.Context,
+	challengeID string,
+	requestingIP string,
+) (PendingChallenge, error) {
+	if !s.realOTPAvailable() {
+		return PendingChallenge{}, ErrAuthenticationUnavailable
+	}
+	if !validChallengeID(challengeID) {
+		return PendingChallenge{}, ErrOTPInvalid
+	}
+	if err := s.otpLimiter.AllowResend(ctx, challengeID, requestingIP); err != nil {
+		if errors.Is(err, ErrOTPResendRateLimited) {
+			return PendingChallenge{}, ErrOTPResendRateLimited
+		}
+		return PendingChallenge{}, ErrAuthenticationUnavailable
+	}
+
+	startedAt := s.now().UTC()
+	expiresAt := startedAt.Add(otpValidity)
+	resendAvailableAt := startedAt.Add(otpResendCooldown)
+	for attempt := 0; attempt < maxOTPRotationGenerateTries; attempt++ {
+		otp, err := generateSixDigitOTP(s.random)
+		if err != nil {
+			return PendingChallenge{}, ErrAuthenticationUnavailable
+		}
+		digest, err := s.otpHasher.hash(challengeID, otp)
+		if err != nil {
+			return PendingChallenge{}, ErrAuthenticationUnavailable
+		}
+
+		delivery, err := s.store.BeginOTPChallengeResend(
+			ctx,
+			challengeID,
+			digest[:],
+			startedAt,
+			expiresAt,
+			resendAvailableAt,
+		)
+		if errors.Is(err, ErrOTPRotationCollision) {
+			continue
+		}
+		if err != nil {
+			return PendingChallenge{}, publicOTPError(err)
+		}
+
+		if err := s.emailSender.SendOTP(ctx, OTPEmail{
+			RecipientEmail: delivery.SuperAdmin.Email,
+			DisplayName:    delivery.SuperAdmin.DisplayName,
+			OTP:            otp,
+			ExpiresAt:      delivery.ExpiresAt,
+		}); err != nil {
+			s.invalidateFailedDelivery(ctx, challengeID, delivery.DeliveryVersion)
+			return PendingChallenge{}, ErrAuthenticationUnavailable
+		}
+		if err := s.store.ActivateOTPChallenge(
+			ctx,
+			challengeID,
+			delivery.DeliveryVersion,
+			s.now().UTC(),
+		); err != nil {
+			s.invalidateFailedDelivery(ctx, challengeID, delivery.DeliveryVersion)
+			return PendingChallenge{}, ErrAuthenticationUnavailable
+		}
+
+		return pendingChallenge(
+			delivery.ChallengeID,
+			delivery.SuperAdmin.Email,
+			delivery.ExpiresAt,
+			delivery.ResendAvailableAt,
+		), nil
+	}
+
+	return PendingChallenge{}, ErrAuthenticationUnavailable
+}
+
+func (s *Service) GetOTPChallengeStatus(
+	ctx context.Context,
+	challengeID string,
+) (ChallengeState, error) {
+	if !s.realOTPAvailable() {
+		return ChallengeState{}, ErrAuthenticationUnavailable
+	}
+	if !validChallengeID(challengeID) {
+		return ChallengeState{}, ErrOTPInvalid
+	}
+
+	challenge, err := s.store.FindOTPChallenge(ctx, challengeID)
+	if err != nil {
+		return ChallengeState{}, publicOTPError(err)
+	}
+
+	state := OTPChallengePending
+	now := s.now().UTC()
+	switch {
+	case challenge.FailedAttempts >= maxOTPFailedAttempts:
+		state = OTPChallengeLocked
+	case challenge.ConsumedAt != nil:
+		state = OTPChallengeUsed
+	case challenge.InvalidatedAt != nil || !challenge.SuperAdmin.IsActive:
+		state = OTPChallengeInvalid
+	case !challenge.ExpiresAt.After(now):
+		state = OTPChallengeExpired
+	case challenge.ActiveVersion == nil || *challenge.ActiveVersion != challenge.DeliveryVersion:
+		return ChallengeState{}, ErrAuthenticationUnavailable
+	}
+
+	return ChallengeState{
+		PendingChallenge: pendingChallenge(
+			challenge.ID,
+			challenge.SuperAdmin.Email,
+			challenge.ExpiresAt,
+			challenge.ResendAvailableAt,
+		),
+		State: state,
+	}, nil
+}
+
+func (s *Service) invalidateFailedDelivery(
+	ctx context.Context,
+	challengeID string,
+	deliveryVersion int,
+) {
+	// Cleanup gets a short independent deadline so a disconnected browser does
+	// not strand provider-failure state as nonterminal. If PostgreSQL is also
+	// unavailable, active_version remains NULL and verification still fails
+	// closed; the original delivery/activation failure remains authoritative.
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), otpCleanupTimeout)
+	defer cancel()
+	_ = s.store.InvalidateOTPChallengeDelivery(
+		cleanupCtx,
+		challengeID,
+		deliveryVersion,
+		s.now().UTC(),
+	)
+}
+
+func (s *Service) realOTPAvailable() bool {
+	return !s.otpBypassEnabled && s.otpLimiter != nil && s.emailSender != nil && s.otpHasher != nil
+}
+
+func pendingChallenge(
+	challengeID string,
+	email string,
+	expiresAt time.Time,
+	resendAvailableAt time.Time,
+) PendingChallenge {
+	return PendingChallenge{
+		ID:                challengeID,
+		ExpiresAt:         expiresAt,
+		ResendAvailableAt: resendAvailableAt,
+		DestinationHint:   destinationHint(email),
+	}
+}
+
+func publicOTPError(err error) error {
+	switch {
+	case errors.Is(err, ErrOTPChallengeNotFound):
+		return ErrOTPInvalid
+	case errors.Is(err, ErrOTPInvalid),
+		errors.Is(err, ErrOTPExpired),
+		errors.Is(err, ErrOTPAttemptsExceeded),
+		errors.Is(err, ErrOTPResendTooEarly),
+		errors.Is(err, ErrOTPInvalidated),
+		errors.Is(err, ErrOTPConsumed),
+		errors.Is(err, ErrOTPVerifyRateLimited),
+		errors.Is(err, ErrOTPResendRateLimited):
+		return err
+	default:
+		return ErrAuthenticationUnavailable
+	}
 }
 
 // ResolveSession performs every authoritative lookup and validity check from

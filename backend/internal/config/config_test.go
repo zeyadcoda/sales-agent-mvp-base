@@ -1,6 +1,8 @@
 package config
 
 import (
+	"encoding/base64"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,10 +20,23 @@ func setValidEnvironment(t *testing.T) {
 	t.Setenv("EXECUTION_ENV", "TEST")
 	t.Setenv("API_HOST", "127.0.0.1")
 	t.Setenv("API_PORT", "8081")
-	t.Setenv("APP_ORIGIN", "http://127.0.0.1:3000")
+	t.Setenv("APP_ORIGIN", "http://127.0.0.1:3001")
 	t.Setenv("AUTH_OTP_BYPASS", "")
 	t.Setenv("AUTH_SESSION_TTL", "")
 	t.Setenv("AUTH_TRUSTED_PROXY_CIDRS", "")
+	t.Setenv(
+		"AUTH_OTP_HMAC_SECRET",
+		base64.StdEncoding.EncodeToString([]byte(strings.Repeat("k", 32))),
+	)
+	t.Setenv("AUTH_EMAIL_MODE", "smtp")
+	t.Setenv("AUTH_EMAIL_FROM_ADDRESS", "no-reply@example.com")
+	t.Setenv("AUTH_EMAIL_FROM_NAME", "Sales Agent")
+	t.Setenv("AUTH_SMTP_HOST", "smtp.example.com")
+	t.Setenv("AUTH_SMTP_PORT", "465")
+	t.Setenv("AUTH_SMTP_TLS_MODE", "tls")
+	t.Setenv("AUTH_SMTP_USERNAME", "smtp-user")
+	t.Setenv("AUTH_SMTP_PASSWORD", "smtp-password")
+	t.Setenv("AUTH_SMTP_TIMEOUT", "")
 
 	t.Setenv(
 		"DATABASE_URL",
@@ -68,8 +83,8 @@ func TestLoadValidConfiguration(t *testing.T) {
 		)
 	}
 
-	if cfg.AppOrigin != "http://127.0.0.1:3000" {
-		t.Fatalf("AppOrigin = %q, want %q", cfg.AppOrigin, "http://127.0.0.1:3000")
+	if cfg.AppOrigin != "http://127.0.0.1:3001" {
+		t.Fatalf("AppOrigin = %q, want %q", cfg.AppOrigin, "http://127.0.0.1:3001")
 	}
 
 	if cfg.AuthOTPBypass {
@@ -78,6 +93,18 @@ func TestLoadValidConfiguration(t *testing.T) {
 
 	if cfg.AuthSessionTTL != 8*time.Hour {
 		t.Fatalf("AuthSessionTTL = %s, want %s", cfg.AuthSessionTTL, 8*time.Hour)
+	}
+	if len(cfg.AuthOTPHMACSecret) != 32 {
+		t.Fatalf("len(AuthOTPHMACSecret) = %d, want 32", len(cfg.AuthOTPHMACSecret))
+	}
+	if cfg.AuthEmail.Mode != AuthEmailSMTP {
+		t.Fatalf("AuthEmail.Mode = %q, want %q", cfg.AuthEmail.Mode, AuthEmailSMTP)
+	}
+	if cfg.AuthEmail.SMTPTLSMode != SMTPTLSDirect {
+		t.Fatalf("AuthEmail.SMTPTLSMode = %q, want %q", cfg.AuthEmail.SMTPTLSMode, SMTPTLSDirect)
+	}
+	if cfg.AuthEmail.SMTPTimeout != defaultSMTPTimeout {
+		t.Fatalf("AuthEmail.SMTPTimeout = %s, want %s", cfg.AuthEmail.SMTPTimeout, defaultSMTPTimeout)
 	}
 	if len(cfg.AuthTrustedProxyCIDRs) != 0 {
 		t.Fatalf("AuthTrustedProxyCIDRs = %v, want none", cfg.AuthTrustedProxyCIDRs)
@@ -145,6 +172,12 @@ func TestLoadAllowsLocalOTPBypass(t *testing.T) {
 	if !cfg.AuthOTPBypass {
 		t.Fatal("AuthOTPBypass = false, want true")
 	}
+	if cfg.AuthOTPHMACSecret != nil {
+		t.Fatal("AuthOTPHMACSecret should not be loaded while the local bypass is enabled")
+	}
+	if cfg.AuthEmail != (AuthEmailConfig{}) {
+		t.Fatal("AuthEmail should not be loaded while the local bypass is enabled")
+	}
 }
 
 func TestLoadRejectsOTPBypassOutsideLocal(t *testing.T) {
@@ -174,6 +207,8 @@ func TestLoadAcceptsDisabledOTPBypassOutsideLocal(t *testing.T) {
 
 			if appEnvironment == AppProduction {
 				t.Setenv("APP_ORIGIN", "https://admin.example.com")
+			} else {
+				setMailpitEmailEnvironment(t)
 			}
 
 			cfg, err := Load()

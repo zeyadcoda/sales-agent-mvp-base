@@ -26,6 +26,7 @@ describe("Super Admin login", () => {
 
   beforeEach(() => {
     vi.stubGlobal("fetch", fetchMock);
+    window.sessionStorage.clear();
   });
 
   afterEach(() => {
@@ -89,6 +90,7 @@ describe("Super Admin login", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "The email or password is incorrect.",
     );
+    expect(screen.getByLabelText("Password")).toHaveValue("");
     expect(router.replace).not.toHaveBeenCalled();
   });
 
@@ -138,6 +140,49 @@ describe("Super Admin login", () => {
       email: "admin@example.com",
       password: "correct password",
     });
+    expect(screen.getByLabelText("Password")).toHaveValue("");
+    expect(window.sessionStorage).toHaveLength(0);
+  });
+
+  it("stores only safe challenge context and navigates to OTP verification", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(
+        {
+          data: {
+            authentication_state: "OTP_REQUIRED",
+            challenge: {
+              challenge_id: "challenge_0123456789abcdef",
+              expires_at: "2026-08-19T12:10:00Z",
+              resend_available_at: "2026-08-19T12:01:00Z",
+              destination_hint: "a***@example.com",
+            },
+          },
+        },
+        202,
+      ),
+    );
+
+    const user = userEvent.setup();
+    render(<LoginPage />);
+
+    await user.type(screen.getByLabelText("Email"), "admin@example.com");
+    await user.type(screen.getByLabelText("Password"), "correct password");
+    await user.click(screen.getByRole("button", { name: "Sign in" }));
+
+    await waitFor(() => expect(router.replace).toHaveBeenCalledWith("/verify-otp"));
+    expect(screen.getByLabelText("Password")).toHaveValue("");
+
+    const persistedChallenge = JSON.parse(
+      window.sessionStorage.getItem("sales_agent_otp_challenge") ?? "{}",
+    );
+    expect(persistedChallenge).toEqual({
+      challenge_id: "challenge_0123456789abcdef",
+      expires_at: "2026-08-19T12:10:00Z",
+      resend_available_at: "2026-08-19T12:01:00Z",
+      destination_hint: "a***@example.com",
+    });
+    expect(JSON.stringify(persistedChallenge)).not.toContain("correct password");
+    expect(JSON.stringify(persistedChallenge)).not.toContain("csrf");
   });
 
   it.each([
@@ -148,7 +193,7 @@ describe("Super Admin login", () => {
     ],
     [
       "OTP_REQUIRED",
-      "Email verification is required. OTP verification will be available in the next milestone.",
+      "Email verification is required. Please sign in again.",
     ],
     ["INVALID_REQUEST", "Check your email and password and try again."],
     ["UNEXPECTED", "Something went wrong. Please try again."],

@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,9 +17,12 @@ import (
 )
 
 const (
-	sessionCookieName           = "sales_agent_session"
-	maxAuthBodyBytes            = 8 * 1024
-	authServiceOperationTimeout = 10 * time.Second
+	sessionCookieName = "sales_agent_session"
+	maxAuthBodyBytes  = 8 * 1024
+	// SMTP is allowed a bounded 30-second timeout. The enclosing auth budget
+	// leaves time for Redis, password verification, and PostgreSQL activation
+	// after delivery completes.
+	authServiceOperationTimeout = 40 * time.Second
 )
 
 type AuthenticationService interface {
@@ -27,7 +31,19 @@ type AuthenticationService interface {
 		email string,
 		password string,
 		requestingIP string,
-	) (auth.AuthenticatedSession, string, error)
+	) (auth.LoginResult, error)
+	VerifyOTP(
+		ctx context.Context,
+		challengeID string,
+		otp string,
+		requestingIP string,
+	) (auth.AuthenticatedLogin, error)
+	ResendOTP(
+		ctx context.Context,
+		challengeID string,
+		requestingIP string,
+	) (auth.PendingChallenge, error)
+	GetOTPChallengeStatus(ctx context.Context, challengeID string) (auth.ChallengeState, error)
 	ResolveSession(ctx context.Context, rawSessionToken string) (auth.AuthenticatedSession, error)
 	Logout(ctx context.Context, rawSessionToken string, csrfToken string) error
 }
@@ -130,7 +146,7 @@ func (handler *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 
 	operationCtx, cancelOperation := handler.serviceOperationContext(r.Context())
 	defer cancelOperation()
-	session, rawSessionToken, err := handler.service.Login(
+	result, err := handler.service.Login(
 		operationCtx,
 		request.Email,
 		request.Password,
@@ -141,10 +157,25 @@ func (handler *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The raw token crosses the application boundary only through an HttpOnly
-	// cookie. It is never serialized in JSON or made available to JavaScript.
-	handler.setSessionCookie(w, rawSessionToken, session.ExpiresAt)
-	writeJSON(w, http.StatusOK, handler.response(session))
+	switch {
+	case result.Authenticated != nil && result.Challenge == nil:
+		// The raw token crosses the application boundary only through an HttpOnly
+		// cookie. It is never serialized in JSON or made available to JavaScript.
+		handler.setSessionCookie(
+			w,
+			result.Authenticated.RawSessionToken,
+			result.Authenticated.Session.ExpiresAt,
+		)
+		writeJSON(w, http.StatusOK, handler.response(result.Authenticated.Session))
+
+	case result.Challenge != nil && result.Authenticated == nil:
+		writeJSON(w, http.StatusAccepted, otpRequiredResponse(*result.Challenge))
+
+	default:
+		// A service result that is neither exactly one completed session nor one
+		// pending challenge violates the authentication sequencing contract.
+		handler.writeAuthError(w, r, auth.ErrAuthenticationUnavailable)
+	}
 }
 
 func (handler *AuthHandler) Session(w http.ResponseWriter, r *http.Request) {
@@ -227,7 +258,33 @@ func (handler *AuthHandler) writeAuthError(w http.ResponseWriter, r *http.Reques
 		w.Header().Set("Retry-After", "900")
 		writeAPIError(w, r, http.StatusTooManyRequests, "AUTHENTICATION_RATE_LIMITED", "Too many sign-in attempts. Try again later.", nil)
 	case errors.Is(err, auth.ErrOTPRequired):
+		// Retained as a safe compatibility mapping for callers built against the
+		// Milestone 01 service contract. The real flow now returns a challenge.
 		writeAPIError(w, r, http.StatusPreconditionRequired, "OTP_REQUIRED", "Email verification is required to complete sign in.", nil)
+	case errors.Is(err, auth.ErrOTPInvalid), errors.Is(err, auth.ErrOTPChallengeNotFound):
+		writeAPIError(w, r, http.StatusUnauthorized, "AUTH_OTP_INVALID", "The verification code or request is invalid.", nil)
+	case errors.Is(err, auth.ErrOTPExpired):
+		writeAPIError(w, r, http.StatusGone, "AUTH_OTP_EXPIRED", "The verification request has expired. Restart login.", nil)
+	case errors.Is(err, auth.ErrOTPAttemptsExceeded):
+		writeAPIError(w, r, http.StatusLocked, "AUTH_OTP_ATTEMPTS_EXCEEDED", "The verification request can no longer be used. Restart login.", nil)
+	case errors.Is(err, auth.ErrOTPInvalidated):
+		writeAPIError(w, r, http.StatusConflict, "AUTH_OTP_INVALIDATED", "The verification request can no longer be used. Restart login.", nil)
+	case errors.Is(err, auth.ErrOTPConsumed):
+		writeAPIError(w, r, http.StatusConflict, "AUTH_OTP_CONSUMED", "The verification request has already been used. Restart login.", nil)
+	case errors.Is(err, auth.ErrOTPResendTooEarly):
+		retryAfterSeconds := int64(60)
+		var tooEarly *auth.OTPResendTooEarlyError
+		if errors.As(err, &tooEarly) {
+			seconds := int64(tooEarly.RetryAfter / time.Second)
+			if seconds >= 1 && seconds <= 60 {
+				retryAfterSeconds = seconds
+			}
+		}
+		w.Header().Set("Retry-After", strconv.FormatInt(retryAfterSeconds, 10))
+		writeAPIError(w, r, http.StatusTooManyRequests, "AUTH_OTP_RESEND_TOO_EARLY", "A new code is not available yet.", nil)
+	case errors.Is(err, auth.ErrOTPVerifyRateLimited), errors.Is(err, auth.ErrOTPResendRateLimited):
+		w.Header().Set("Retry-After", "900")
+		writeAPIError(w, r, http.StatusTooManyRequests, "AUTH_OTP_RATE_LIMITED", "Too many verification requests. Try again later.", nil)
 	case errors.Is(err, auth.ErrUnauthenticated):
 		writeAPIError(w, r, http.StatusUnauthorized, "UNAUTHENTICATED", "A valid Super Admin session is required.", nil)
 	case errors.Is(err, auth.ErrInvalidCSRFToken):

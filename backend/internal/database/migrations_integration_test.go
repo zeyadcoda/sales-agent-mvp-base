@@ -47,31 +47,58 @@ func TestMigrationsUpAndDown(t *testing.T) {
 	if err := goose.DownTo(db, migrationsDirectory, 0); err != nil {
 		t.Fatalf("reset migration test database: %v", err)
 	}
-	if err := goose.Up(db, migrationsDirectory); err != nil {
-		t.Fatalf("migrate empty database up: %v", err)
-	}
 
-	for _, table := range []string{"schema_marker", "super_admin_accounts", "super_admin_sessions"} {
-		var exists bool
-		if err := db.QueryRow(`SELECT to_regclass($1) IS NOT NULL`, "public."+table).Scan(&exists); err != nil {
-			t.Fatalf("check table %s: %v", table, err)
-		}
-		if !exists {
-			t.Fatalf("table %s was not created", table)
-		}
+	if err := goose.UpTo(db, migrationsDirectory, 1); err != nil {
+		t.Fatalf("apply migration 00001: %v", err)
 	}
+	assertMigrationTableExists(t, db, "schema_marker", true)
+
+	if err := goose.UpTo(db, migrationsDirectory, 2); err != nil {
+		t.Fatalf("apply migration 00002: %v", err)
+	}
+	assertMigrationTableExists(t, db, "super_admin_accounts", true)
+	assertMigrationTableExists(t, db, "super_admin_sessions", true)
+
+	if err := goose.UpTo(db, migrationsDirectory, 3); err != nil {
+		t.Fatalf("apply migration 00003: %v", err)
+	}
+	assertMigrationTableExists(t, db, "super_admin_auth_challenges", true)
+
+	// Prove the new migration can roll back independently without disturbing
+	// the historical Milestone 01 schema, then apply cleanly again.
+	if err := goose.Down(db, migrationsDirectory); err != nil {
+		t.Fatalf("roll migration 00003 down: %v", err)
+	}
+	assertMigrationTableExists(t, db, "super_admin_auth_challenges", false)
+	assertMigrationTableExists(t, db, "super_admin_accounts", true)
+	assertMigrationTableExists(t, db, "super_admin_sessions", true)
+	if err := goose.Up(db, migrationsDirectory); err != nil {
+		t.Fatalf("re-apply migration 00003: %v", err)
+	}
+	assertMigrationTableExists(t, db, "super_admin_auth_challenges", true)
 
 	if err := goose.DownTo(db, migrationsDirectory, 0); err != nil {
 		t.Fatalf("roll migrations down: %v", err)
 	}
-	for _, table := range []string{"schema_marker", "super_admin_accounts", "super_admin_sessions"} {
-		var exists bool
-		if err := db.QueryRow(`SELECT to_regclass($1) IS NOT NULL`, "public."+table).Scan(&exists); err != nil {
-			t.Fatalf("check rolled-back table %s: %v", table, err)
-		}
-		if exists {
-			t.Fatalf("table %s still exists after rollback", table)
-		}
+	for _, table := range []string{
+		"schema_marker",
+		"super_admin_accounts",
+		"super_admin_sessions",
+		"super_admin_auth_challenges",
+	} {
+		assertMigrationTableExists(t, db, table, false)
+	}
+}
+
+func assertMigrationTableExists(t *testing.T, db *sql.DB, table string, want bool) {
+	t.Helper()
+
+	var exists bool
+	if err := db.QueryRow(`SELECT to_regclass($1) IS NOT NULL`, "public."+table).Scan(&exists); err != nil {
+		t.Fatalf("check table %s: %v", table, err)
+	}
+	if exists != want {
+		t.Fatalf("table %s existence = %v, want %v", table, exists, want)
 	}
 }
 

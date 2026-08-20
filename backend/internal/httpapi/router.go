@@ -62,6 +62,9 @@ func NewRouter(readiness ReadinessChecker, authHandlers ...*AuthHandler) http.Ha
 	if len(authHandlers) > 0 && authHandlers[0] != nil {
 		authHandler := authHandlers[0]
 		mux.HandleFunc("POST /api/v1/auth/login", authHandler.Login)
+		mux.HandleFunc("POST /api/v1/auth/otp/verify", authHandler.VerifyOTP)
+		mux.HandleFunc("POST /api/v1/auth/otp/resend", authHandler.ResendOTP)
+		mux.HandleFunc("POST /api/v1/auth/otp/status", authHandler.OTPChallengeStatus)
 		mux.HandleFunc("GET /api/v1/auth/session", authHandler.Session)
 		mux.HandleFunc("POST /api/v1/auth/logout", authHandler.Logout)
 
@@ -80,7 +83,11 @@ func authRouteFallback(w http.ResponseWriter, r *http.Request) {
 
 	var allowed string
 	switch r.URL.Path {
-	case "/api/v1/auth/login", "/api/v1/auth/logout":
+	case "/api/v1/auth/login",
+		"/api/v1/auth/logout",
+		"/api/v1/auth/otp/verify",
+		"/api/v1/auth/otp/resend",
+		"/api/v1/auth/otp/status":
 		allowed = http.MethodPost
 	case "/api/v1/auth/session":
 		allowed = http.MethodGet + ", " + http.MethodHead

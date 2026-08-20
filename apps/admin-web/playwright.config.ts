@@ -1,10 +1,13 @@
 import { defineConfig } from "@playwright/test";
 
 const configuredBaseURL = process.env.PLAYWRIGHT_BASE_URL?.trim();
-const baseURL = configuredBaseURL || "http://127.0.0.1:3000";
+const baseURL = configuredBaseURL || "http://127.0.0.1:3001";
 
 export default defineConfig({
   testDir: "./tests/e2e",
+  // The real resend scenario intentionally waits through the authoritative
+  // 60-second cooldown before exercising OTP rotation.
+  timeout: 120_000,
   fullyParallel: false,
   forbidOnly: Boolean(process.env.CI),
   retries: process.env.CI ? 1 : 0,
