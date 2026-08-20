@@ -95,6 +95,16 @@ func (db *Postgres) QueryRow(ctx context.Context, query string, args ...any) pgx
 	return db.pool.QueryRow(ctx, query, args...)
 }
 
+// Begin starts a PostgreSQL transaction for application services whose
+// security invariants require multiple writes to commit atomically.
+func (db *Postgres) Begin(ctx context.Context) (pgx.Tx, error) {
+	if db == nil || db.pool == nil {
+		return nil, ErrDatabaseNotInitialized
+	}
+
+	return db.pool.Begin(ctx)
+}
+
 type errorRow struct {
 	err error
 }

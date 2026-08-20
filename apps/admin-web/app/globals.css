@@ -204,6 +204,12 @@ h1 {
   background: var(--danger-soft);
 }
 
+.alert-success {
+  border-color: #b9dcd7;
+  color: #0d5a52;
+  background: var(--primary-soft);
+}
+
 .button {
   display: inline-flex;
   min-height: 44px;
@@ -243,6 +249,20 @@ h1 {
   background: var(--surface-muted);
 }
 
+.button-link {
+  padding: 2px;
+  border: 0;
+  color: var(--primary);
+  background: transparent;
+  font-weight: 750;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.button-link:hover:not(:disabled) {
+  color: var(--primary-hover);
+}
+
 .button-full {
   width: 100%;
   margin-top: 2px;
@@ -253,6 +273,58 @@ h1 {
   color: var(--text-muted);
   font-size: 0.78rem;
   text-align: center;
+}
+
+.otp-heading {
+  margin-bottom: 24px;
+}
+
+.otp-input {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.34em;
+  text-align: center;
+}
+
+.field-guidance {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+}
+
+.otp-resend {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  color: var(--text-muted);
+  font-size: 0.86rem;
+}
+
+.otp-resend p {
+  margin: 0;
+}
+
+.otp-restart {
+  justify-self: center;
+}
+
+.otp-state {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 36px;
+  color: var(--text-muted);
+}
+
+.otp-terminal {
+  margin-bottom: 0;
+}
+
+.otp-status-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 24px;
 }
 
 .dashboard-shell {

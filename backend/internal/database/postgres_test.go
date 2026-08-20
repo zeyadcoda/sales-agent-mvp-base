@@ -24,6 +24,20 @@ func TestOpenRejectsMissingDatabaseURL(t *testing.T) {
 	}
 }
 
+func TestPostgresBeginRejectsUninitializedDatabase(t *testing.T) {
+	t.Parallel()
+
+	var db *Postgres
+	transaction, err := db.Begin(context.Background())
+
+	if transaction != nil {
+		t.Fatal("transaction should be nil for an uninitialized database")
+	}
+	if !errors.Is(err, ErrDatabaseNotInitialized) {
+		t.Fatalf("error = %v, want %v", err, ErrDatabaseNotInitialized)
+	}
+}
+
 // TestPostgresPing proves that the Go backend can communicate with a real
 // PostgreSQL instance.
 //

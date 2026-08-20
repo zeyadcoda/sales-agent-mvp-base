@@ -23,10 +23,10 @@ var ErrRedisNotInitialized = errors.New("redis is not initialized")
 // permanent or ambiguously named security counters.
 var ErrInvalidRateLimitCounter = errors.New("invalid rate limit counter input")
 
-// incrementLoginAttemptCountersScript updates the email and network counters
-// in one Redis operation. The expiry is set only when a fixed window begins;
-// later attempts cannot extend the window indefinitely.
-var incrementLoginAttemptCountersScript = redis.NewScript(`
+// incrementAttemptCountersScript updates both abuse-control dimensions in one
+// Redis operation. The expiry is set only when a fixed window begins; later
+// attempts cannot extend the window indefinitely.
+var incrementAttemptCountersScript = redis.NewScript(`
 local function increment_with_expiry(key, ttl_ms)
   local count = redis.call("INCR", key)
   if count == 1 or redis.call("PTTL", key) < 0 then
@@ -99,21 +99,43 @@ func (r *Redis) IncrementLoginAttemptCounters(
 	ipCounterKey string,
 	window time.Duration,
 ) (emailAttempts int64, ipAttempts int64, err error) {
+	return r.incrementAttemptCounters(ctx, emailCounterKey, ipCounterKey, window)
+}
+
+// IncrementOTPAttemptCounters atomically consumes an attempt from both the
+// opaque challenge and requesting-network dimensions. PostgreSQL still owns
+// OTP lifecycle and the five-failure lock; Redis adds fail-closed abuse
+// protection without becoming authentication state.
+func (r *Redis) IncrementOTPAttemptCounters(
+	ctx context.Context,
+	challengeCounterKey string,
+	ipCounterKey string,
+	window time.Duration,
+) (challengeAttempts int64, ipAttempts int64, err error) {
+	return r.incrementAttemptCounters(ctx, challengeCounterKey, ipCounterKey, window)
+}
+
+func (r *Redis) incrementAttemptCounters(
+	ctx context.Context,
+	firstCounterKey string,
+	secondCounterKey string,
+	window time.Duration,
+) (firstAttempts int64, secondAttempts int64, err error) {
 	if r == nil || r.client == nil {
 		return 0, 0, ErrRedisNotInitialized
 	}
 
-	if strings.TrimSpace(emailCounterKey) == "" ||
-		strings.TrimSpace(ipCounterKey) == "" ||
-		emailCounterKey == ipCounterKey ||
+	if strings.TrimSpace(firstCounterKey) == "" ||
+		strings.TrimSpace(secondCounterKey) == "" ||
+		firstCounterKey == secondCounterKey ||
 		window < time.Millisecond {
 		return 0, 0, ErrInvalidRateLimitCounter
 	}
 
-	result, err := incrementLoginAttemptCountersScript.Run(
+	result, err := incrementAttemptCountersScript.Run(
 		ctx,
 		r.client,
-		[]string{emailCounterKey, ipCounterKey},
+		[]string{firstCounterKey, secondCounterKey},
 		window.Milliseconds(),
 	).Slice()
 	if err != nil {
@@ -121,16 +143,16 @@ func (r *Redis) IncrementLoginAttemptCounters(
 	}
 
 	if len(result) != 2 {
-		return 0, 0, fmt.Errorf("unexpected login rate limit counter response")
+		return 0, 0, fmt.Errorf("unexpected rate limit counter response")
 	}
 
-	emailAttempts, emailOK := result[0].(int64)
-	ipAttempts, ipOK := result[1].(int64)
-	if !emailOK || !ipOK || emailAttempts < 1 || ipAttempts < 1 {
-		return 0, 0, fmt.Errorf("invalid login rate limit counter response")
+	firstAttempts, firstOK := result[0].(int64)
+	secondAttempts, secondOK := result[1].(int64)
+	if !firstOK || !secondOK || firstAttempts < 1 || secondAttempts < 1 {
+		return 0, 0, fmt.Errorf("invalid rate limit counter response")
 	}
 
-	return emailAttempts, ipAttempts, nil
+	return firstAttempts, secondAttempts, nil
 }
 
 // Close releases resources owned by the Redis client.

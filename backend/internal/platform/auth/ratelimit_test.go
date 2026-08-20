@@ -26,6 +26,49 @@ type memoryLoginCounterStore struct {
 	returnZero  bool
 }
 
+type memoryOTPAttemptCounterStore struct {
+	mu sync.Mutex
+
+	challengeCounts map[string]int64
+	ipCounts        map[string]int64
+	calls           []counterCall
+	err             error
+	returnZero      bool
+}
+
+func newMemoryOTPAttemptCounterStore() *memoryOTPAttemptCounterStore {
+	return &memoryOTPAttemptCounterStore{
+		challengeCounts: make(map[string]int64),
+		ipCounts:        make(map[string]int64),
+	}
+}
+
+func (store *memoryOTPAttemptCounterStore) IncrementOTPAttemptCounters(
+	_ context.Context,
+	challengeCounterKey string,
+	ipCounterKey string,
+	window time.Duration,
+) (int64, int64, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	store.calls = append(store.calls, counterCall{
+		emailKey: challengeCounterKey,
+		ipKey:    ipCounterKey,
+		window:   window,
+	})
+	if store.err != nil {
+		return 0, 0, store.err
+	}
+	if store.returnZero {
+		return 0, 0, nil
+	}
+
+	store.challengeCounts[challengeCounterKey]++
+	store.ipCounts[ipCounterKey]++
+	return store.challengeCounts[challengeCounterKey], store.ipCounts[ipCounterKey], nil
+}
+
 func newMemoryLoginCounterStore() *memoryLoginCounterStore {
 	return &memoryLoginCounterStore{
 		emailCounts: make(map[string]int64),
@@ -226,6 +269,98 @@ func TestLoginRateLimiterFailsClosed(t *testing.T) {
 			}
 			if errors.Is(err, ErrRateLimited) {
 				t.Fatalf("Allow() error = %v; dependency failure must not appear as ordinary throttling", err)
+			}
+		})
+	}
+}
+
+func TestOTPRateLimiterThrottlesVerifyAndResendSeparately(t *testing.T) {
+	t.Parallel()
+
+	store := newMemoryOTPAttemptCounterStore()
+	limiter := NewOTPRateLimiter(store)
+	challengeID := tokenFromByte(31)
+
+	for attempt := int64(1); attempt <= defaultOTPChallengeLimit; attempt++ {
+		if err := limiter.AllowVerify(context.Background(), challengeID, "192.0.2.10"); err != nil {
+			t.Fatalf("verify attempt %d: error = %v", attempt, err)
+		}
+	}
+	if err := limiter.AllowVerify(context.Background(), challengeID, "192.0.2.10"); !errors.Is(err, ErrOTPVerifyRateLimited) {
+		t.Fatalf("verify over limit error = %v, want %v", err, ErrOTPVerifyRateLimited)
+	}
+
+	// Resend has a distinct keyspace, so verification traffic cannot consume
+	// its allowance (PostgreSQL still independently enforces the cooldown).
+	for attempt := int64(1); attempt <= defaultOTPChallengeLimit; attempt++ {
+		if err := limiter.AllowResend(context.Background(), challengeID, "192.0.2.10"); err != nil {
+			t.Fatalf("resend attempt %d: error = %v", attempt, err)
+		}
+	}
+	if err := limiter.AllowResend(context.Background(), challengeID, "192.0.2.10"); !errors.Is(err, ErrOTPResendRateLimited) {
+		t.Fatalf("resend over limit error = %v, want %v", err, ErrOTPResendRateLimited)
+	}
+}
+
+func TestOTPRateLimiterUsesOpaqueLayeredKeys(t *testing.T) {
+	t.Parallel()
+
+	store := newMemoryOTPAttemptCounterStore()
+	limiter := NewOTPRateLimiter(store)
+	challengeID := tokenFromByte(32)
+	requestingIP := "2001:db8::20"
+
+	if err := limiter.AllowVerify(context.Background(), challengeID, requestingIP); err != nil {
+		t.Fatalf("AllowVerify() error = %v", err)
+	}
+	if err := limiter.AllowResend(context.Background(), challengeID, requestingIP); err != nil {
+		t.Fatalf("AllowResend() error = %v", err)
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.calls) != 2 {
+		t.Fatalf("counter calls = %d, want 2", len(store.calls))
+	}
+	verifyCall, resendCall := store.calls[0], store.calls[1]
+	if verifyCall.emailKey == resendCall.emailKey || verifyCall.ipKey == resendCall.ipKey {
+		t.Fatal("verify and resend counter keys are not operation-separated")
+	}
+	for _, call := range store.calls {
+		if strings.Contains(call.emailKey, challengeID) || strings.Contains(call.ipKey, requestingIP) {
+			t.Fatalf("OTP Redis key contains plaintext identity: %#v", call)
+		}
+		if call.window != defaultOTPWindow {
+			t.Fatalf("OTP counter window = %s, want %s", call.window, defaultOTPWindow)
+		}
+	}
+}
+
+func TestOTPRateLimiterFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	challengeID := tokenFromByte(33)
+	tests := []struct {
+		name      string
+		limiter   OTPRateLimiter
+		challenge string
+		ip        string
+	}{
+		{name: "missing store", limiter: NewOTPRateLimiter(nil), challenge: challengeID, ip: "192.0.2.1"},
+		{name: "Redis failure", limiter: NewOTPRateLimiter(&memoryOTPAttemptCounterStore{err: errors.New("Redis failure")}), challenge: challengeID, ip: "192.0.2.1"},
+		{name: "zero counter", limiter: NewOTPRateLimiter(&memoryOTPAttemptCounterStore{returnZero: true}), challenge: challengeID, ip: "192.0.2.1"},
+		{name: "malformed challenge", limiter: NewOTPRateLimiter(newMemoryOTPAttemptCounterStore()), challenge: "bad", ip: "192.0.2.1"},
+		{name: "malformed IP", limiter: NewOTPRateLimiter(newMemoryOTPAttemptCounterStore()), challenge: challengeID, ip: "bad"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if err := test.limiter.AllowVerify(context.Background(), test.challenge, test.ip); !errors.Is(err, ErrRateLimitUnavailable) {
+				t.Fatalf("AllowVerify() error = %v, want %v", err, ErrRateLimitUnavailable)
+			}
+			if err := test.limiter.AllowResend(context.Background(), test.challenge, test.ip); !errors.Is(err, ErrRateLimitUnavailable) {
+				t.Fatalf("AllowResend() error = %v, want %v", err, ErrRateLimitUnavailable)
 			}
 		})
 	}

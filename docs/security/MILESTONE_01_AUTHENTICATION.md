@@ -47,7 +47,7 @@ Browser code calls `/api/v1/auth/*` on the Next.js origin. `apps/admin-web/next.
 For local development:
 
 ```text
-Browser: http://127.0.0.1:3000
+Browser: http://127.0.0.1:3001
 Next.js rewrite: /api/*
 Go API: http://127.0.0.1:8081
 ```

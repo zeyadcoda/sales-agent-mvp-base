@@ -11,18 +11,37 @@ import (
 )
 
 type fakeStore struct {
-	admin            SuperAdmin
-	adminErr         error
-	createdSession   NewSession
-	createSessionErr error
-	session          Session
-	sessionErr       error
-	lookupTokenHash  []byte
-	touchedSessionID string
-	touchedAt        time.Time
-	touchErr         error
-	revokedSessionID string
-	revokeErr        error
+	admin                      SuperAdmin
+	adminErr                   error
+	createdSession             NewSession
+	createSessionErr           error
+	createdChallenge           NewOTPChallenge
+	createChallengeErr         error
+	activatedChallengeID       string
+	activatedDeliveryVersion   int
+	activateChallengeErr       error
+	invalidatedChallengeID     string
+	invalidatedDeliveryVersion int
+	invalidateChallengeErr     error
+	resendDelivery             OTPDelivery
+	resendErr                  error
+	resendErrors               []error
+	resendHashes               [][]byte
+	verifiedChallengeID        string
+	verifiedCandidateHash      []byte
+	verifiedSession            NewSession
+	verifyAdmin                SuperAdmin
+	verifyErr                  error
+	challenge                  OTPChallenge
+	challengeErr               error
+	session                    Session
+	sessionErr                 error
+	lookupTokenHash            []byte
+	touchedSessionID           string
+	touchedAt                  time.Time
+	touchErr                   error
+	revokedSessionID           string
+	revokeErr                  error
 }
 
 func (store *fakeStore) FindSuperAdminByEmail(_ context.Context, _ string) (SuperAdmin, error) {
@@ -32,6 +51,65 @@ func (store *fakeStore) FindSuperAdminByEmail(_ context.Context, _ string) (Supe
 func (store *fakeStore) CreateSession(_ context.Context, session NewSession) error {
 	store.createdSession = session
 	return store.createSessionErr
+}
+
+func (store *fakeStore) CreateOTPChallenge(_ context.Context, challenge NewOTPChallenge) error {
+	store.createdChallenge = challenge
+	return store.createChallengeErr
+}
+
+func (store *fakeStore) ActivateOTPChallenge(
+	_ context.Context,
+	challengeID string,
+	deliveryVersion int,
+	_ time.Time,
+) error {
+	store.activatedChallengeID = challengeID
+	store.activatedDeliveryVersion = deliveryVersion
+	return store.activateChallengeErr
+}
+
+func (store *fakeStore) InvalidateOTPChallengeDelivery(
+	_ context.Context,
+	challengeID string,
+	deliveryVersion int,
+	_ time.Time,
+) error {
+	store.invalidatedChallengeID = challengeID
+	store.invalidatedDeliveryVersion = deliveryVersion
+	return store.invalidateChallengeErr
+}
+
+func (store *fakeStore) BeginOTPChallengeResend(
+	_ context.Context,
+	_ string,
+	otpHash []byte,
+	_ time.Time,
+	_ time.Time,
+	_ time.Time,
+) (OTPDelivery, error) {
+	store.resendHashes = append(store.resendHashes, append([]byte(nil), otpHash...))
+	if index := len(store.resendHashes) - 1; index < len(store.resendErrors) {
+		return store.resendDelivery, store.resendErrors[index]
+	}
+	return store.resendDelivery, store.resendErr
+}
+
+func (store *fakeStore) VerifyOTPChallengeAndCreateSession(
+	_ context.Context,
+	challengeID string,
+	candidateHash []byte,
+	_ time.Time,
+	session NewSession,
+) (SuperAdmin, error) {
+	store.verifiedChallengeID = challengeID
+	store.verifiedCandidateHash = append([]byte(nil), candidateHash...)
+	store.verifiedSession = session
+	return store.verifyAdmin, store.verifyErr
+}
+
+func (store *fakeStore) FindOTPChallenge(_ context.Context, _ string) (OTPChallenge, error) {
+	return store.challenge, store.challengeErr
 }
 
 func (store *fakeStore) FindSessionByTokenHash(_ context.Context, tokenHash []byte) (Session, error) {
@@ -55,6 +133,33 @@ type fakeLimiter struct {
 	calls int
 	email string
 	ip    string
+}
+
+type fakeOTPLimiter struct {
+	verifyErr   error
+	resendErr   error
+	verifyCalls int
+	resendCalls int
+}
+
+func (limiter *fakeOTPLimiter) AllowVerify(_ context.Context, _, _ string) error {
+	limiter.verifyCalls++
+	return limiter.verifyErr
+}
+
+func (limiter *fakeOTPLimiter) AllowResend(_ context.Context, _, _ string) error {
+	limiter.resendCalls++
+	return limiter.resendErr
+}
+
+type fakeOTPEmailSender struct {
+	messages []OTPEmail
+	err      error
+}
+
+func (sender *fakeOTPEmailSender) SendOTP(_ context.Context, message OTPEmail) error {
+	sender.messages = append(sender.messages, message)
+	return sender.err
 }
 
 func (limiter *fakeLimiter) Allow(_ context.Context, email string, ip string) error {
@@ -114,7 +219,7 @@ func TestLoginUnknownEmailAndWrongPasswordReturnSameFailure(t *testing.T) {
 			limiter := &fakeLimiter{}
 			service := newTestService(t, test.store, limiter, test.verifier, true, now)
 
-			_, _, err := service.Login(
+			_, err := service.Login(
 				context.Background(),
 				" ADMIN@example.com ",
 				"incorrect password",
@@ -144,7 +249,7 @@ func TestLoginLocalBypassCreatesIndependentHashedSession(t *testing.T) {
 	verifier := &fakePasswordVerifier{results: map[string]bool{"stored-hash": true}}
 	service := newTestService(t, store, &fakeLimiter{}, verifier, true, now)
 
-	session, rawToken, err := service.Login(
+	result, err := service.Login(
 		context.Background(),
 		"admin@example.com",
 		"correct password",
@@ -153,6 +258,11 @@ func TestLoginLocalBypassCreatesIndependentHashedSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
+	if result.Authenticated == nil || result.Challenge != nil {
+		t.Fatalf("Login() result = %#v, want authenticated result only", result)
+	}
+	session := result.Authenticated.Session
+	rawToken := result.Authenticated.RawSessionToken
 	if !validOpaqueToken(rawToken) {
 		t.Fatalf("raw session token is not a canonical 256-bit token: %q", rawToken)
 	}
@@ -177,30 +287,34 @@ func TestLoginLocalBypassCreatesIndependentHashedSession(t *testing.T) {
 	}
 }
 
-func TestLoginBypassDisabledNeverCreatesSession(t *testing.T) {
+func TestLoginBypassDisabledCreatesDeliveredChallengeAndNoSession(t *testing.T) {
 	t.Parallel()
 
 	store := &fakeStore{admin: activeAdmin()}
-	service := newTestService(
-		t,
-		store,
-		&fakeLimiter{},
-		&fakePasswordVerifier{results: map[string]bool{"stored-hash": true}},
-		false,
-		time.Now(),
-	)
+	sender := &fakeOTPEmailSender{}
+	now := time.Date(2026, 8, 19, 10, 0, 0, 0, time.UTC)
+	service := newRealOTPTestService(t, store, &fakeOTPLimiter{}, sender, now, otpRandomMaterial(1, 0))
 
-	_, token, err := service.Login(
+	result, err := service.Login(
 		context.Background(),
 		"admin@example.com",
 		"correct password",
 		"192.0.2.10",
 	)
-	if !errors.Is(err, ErrOTPRequired) {
-		t.Fatalf("Login() error = %v, want %v", err, ErrOTPRequired)
+	if err != nil {
+		t.Fatalf("Login() error = %v", err)
 	}
-	if token != "" || store.createdSession.SuperAdminID != "" {
+	if result.Challenge == nil || result.Authenticated != nil {
+		t.Fatalf("Login() result = %#v, want OTP challenge only", result)
+	}
+	if store.createdSession.SuperAdminID != "" {
 		t.Fatal("password authentication without OTP bypass must not create a session")
+	}
+	if len(sender.messages) != 1 || !validOTP(sender.messages[0].OTP) {
+		t.Fatalf("delivered OTP messages = %#v", sender.messages)
+	}
+	if store.activatedChallengeID != result.Challenge.ID || store.activatedDeliveryVersion != 1 {
+		t.Fatalf("activated challenge = (%q, %d)", store.activatedChallengeID, store.activatedDeliveryVersion)
 	}
 }
 
@@ -219,7 +333,7 @@ func TestInactiveSuperAdminCannotLogin(t *testing.T) {
 		time.Now(),
 	)
 
-	_, _, err := service.Login(
+	_, err := service.Login(
 		context.Background(),
 		"admin@example.com",
 		"correct password",
@@ -246,7 +360,7 @@ func TestRedisFailureStopsAuthenticationBeforeAccountLookup(t *testing.T) {
 		time.Now(),
 	)
 
-	_, _, err := service.Login(
+	_, err := service.Login(
 		context.Background(),
 		"admin@example.com",
 		"correct password",
@@ -341,7 +455,9 @@ func TestResolveSessionUsesValidationInstantForLastSeen(t *testing.T) {
 	service, err := NewService(
 		store,
 		&fakeLimiter{},
+		nil,
 		&fakePasswordVerifier{},
+		nil,
 		ServiceOptions{
 			OTPBypassEnabled:  true,
 			SessionTTL:        8 * time.Hour,
@@ -416,7 +532,7 @@ func newTestService(
 	t.Helper()
 
 	randomMaterial := append(bytes.Repeat([]byte{1}, sessionTokenBytes), bytes.Repeat([]byte{2}, sessionTokenBytes)...)
-	service, err := NewService(store, limiter, verifier, ServiceOptions{
+	service, err := NewService(store, limiter, nil, verifier, nil, ServiceOptions{
 		OTPBypassEnabled:  bypass,
 		SessionTTL:        8 * time.Hour,
 		DummyPasswordHash: "dummy-hash",
@@ -428,6 +544,46 @@ func newTestService(
 	}
 
 	return service
+}
+
+func newRealOTPTestService(
+	t *testing.T,
+	store Store,
+	limiter OTPRateLimiter,
+	sender OTPEmailSender,
+	now time.Time,
+	randomMaterial []byte,
+) *Service {
+	t.Helper()
+
+	service, err := NewService(
+		store,
+		&fakeLimiter{},
+		limiter,
+		&fakePasswordVerifier{results: map[string]bool{"stored-hash": true}},
+		sender,
+		ServiceOptions{
+			OTPBypassEnabled:  false,
+			OTPHashSecret:     bytes.Repeat([]byte{7}, otpHashSecretMinBytes),
+			SessionTTL:        8 * time.Hour,
+			DummyPasswordHash: "dummy-hash",
+			Random:            bytes.NewReader(randomMaterial),
+			Now:               func() time.Time { return now },
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	return service
+}
+
+func otpRandomMaterial(challengeByte, otpByte byte) []byte {
+	material := bytes.Repeat([]byte{challengeByte}, challengeIDBytes)
+	material = append(material, otpByte, otpByte, otpByte)
+	material = append(material, bytes.Repeat([]byte{3}, sessionTokenBytes)...)
+	material = append(material, bytes.Repeat([]byte{4}, sessionTokenBytes)...)
+	return material
 }
 
 func activeAdmin() SuperAdmin {

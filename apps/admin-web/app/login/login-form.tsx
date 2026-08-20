@@ -4,6 +4,10 @@ import { FormEvent, useState } from "react";
 import { useRouter } from "next/navigation";
 
 import { getLoginErrorMessage, login } from "../../lib/auth-api";
+import {
+  clearPendingOTPChallenge,
+  savePendingOTPChallenge,
+} from "../../lib/otp-challenge-storage";
 
 interface FieldErrors {
   email?: string;
@@ -33,11 +37,23 @@ export function LoginForm() {
     setIsSubmitting(true);
 
     try {
-      await login({ email: normalizedEmail, password });
+      const result = await login({ email: normalizedEmail, password });
+
+      if (result.authenticationState === "OTP_REQUIRED") {
+        savePendingOTPChallenge(result.challenge);
+        router.replace("/verify-otp");
+        return;
+      }
+
+      clearPendingOTPChallenge();
       router.replace("/dashboard");
     } catch (error) {
       setFormError(getLoginErrorMessage(error));
       setIsSubmitting(false);
+    } finally {
+      // The password is needed only for this request and must not remain in
+      // component state after the request settles.
+      setPassword("");
     }
   }
 
