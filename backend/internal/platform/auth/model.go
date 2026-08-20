@@ -152,6 +152,18 @@ type NewSuperAdmin struct {
 // domain. PostgreSQL implements it; Redis must never implement or replace it.
 type Store interface {
 	FindSuperAdminByEmail(ctx context.Context, normalizedEmail string) (SuperAdmin, error)
+	HasActiveSuperAdminRecovery(
+		ctx context.Context,
+		superAdminID string,
+		checkedAt time.Time,
+	) (bool, error)
+	ConsumeSuperAdminRecoveryAndCreateSession(
+		ctx context.Context,
+		superAdminID string,
+		consumedAt time.Time,
+		session NewSession,
+		correlationID string,
+	) error
 	CreateSession(ctx context.Context, session NewSession) error
 	CreateOTPChallenge(ctx context.Context, challenge NewOTPChallenge) error
 	ActivateOTPChallenge(
@@ -219,8 +231,9 @@ type PendingChallenge struct {
 }
 
 // LoginResult is deliberately discriminated: password authentication yields
-// either a completed local-bypass session or an email-OTP challenge, never
-// both.
+// either a completed server-authorized session or an email-OTP challenge,
+// never both. It contains no marker revealing which server-side path created
+// the normal session.
 type LoginResult struct {
 	Authenticated *AuthenticatedLogin
 	Challenge     *PendingChallenge
